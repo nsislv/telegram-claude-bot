@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-03-30
+
+### Added
+- **Image/screenshot analysis**: Images sent to the bot are now passed as multimodal content blocks via the SDK, enabling Claude to actually see and analyze them (#168, closes #137)
+- **Exponential backoff retry**: Transient `CLIConnectionError` failures are automatically retried with exponential backoff (1s → 3s → 9s, capped at 30s). MCP config errors and timeouts are correctly excluded (#170, closes #60)
+- **Local whisper.cpp voice transcription**: New `VOICE_PROVIDER=local` option for offline voice transcription via whisper.cpp + ffmpeg. No API keys required (#158)
+- **`make run-watch`**: Auto-restart during development via watchfiles (#158)
+- **Inline Stop button**: Cancel running Claude requests with a ⏹ button in the progress message (#122)
+- **Slash command passthrough**: Unknown `/commands` in agentic mode are forwarded to Claude as prompts (#131)
+- **Proxy support**: Explicit proxy configuration for httpx client via `HTTPS_PROXY`/`HTTP_PROXY` env vars (#166)
+
+### Fixed
+- **Empty responses**: "(No content to display)" after tool-heavy tasks — added missing `StreamUpdate` helper methods, fixed `ConversationEnhancer` call signature, and added fallback for tool-only responses (#136, closes #135)
+- **ThinkingBlock raw output**: `ThinkingBlock` objects no longer print as raw Python objects — proper `isinstance` checks extract `.thinking` text (#162, closes #161)
+
 ## [1.5.0] - 2026-03-04
 
 ### Added
