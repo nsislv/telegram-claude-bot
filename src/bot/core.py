@@ -15,6 +15,7 @@ from telegram import Update
 from telegram.ext import (
     AIORateLimiter,
     Application,
+    CallbackQueryHandler,
     ContextTypes,
     Defaults,
     MessageHandler,
@@ -117,35 +118,47 @@ class ClaudeCodeBot:
         self.orchestrator.register_handlers(self.app)
 
     def _add_middleware(self) -> None:
-        """Add middleware to application."""
+        """Add middleware to application.
+
+        Middleware runs in order of group numbers (lower = earlier):
+          group=-3: security validation
+          group=-2: authentication
+          group=-1: rate limiting
+
+        We register each middleware on BOTH ``MessageHandler`` and
+        ``CallbackQueryHandler`` because ``MessageHandler(filters.ALL, ...)``
+        only matches ``message``/``edited_message``/``channel_post`` updates
+        — it does NOT match ``callback_query`` updates. Without the
+        ``CallbackQueryHandler`` registration, inline-button presses would
+        bypass auth/security/rate-limit entirely, allowing an unauthenticated
+        user who guesses or replays a callback_data string (e.g.
+        ``stop:<victim_user_id>``) to reach the handlers directly.
+        """
         from .middleware.auth import auth_middleware
         from .middleware.rate_limit import rate_limit_middleware
         from .middleware.security import security_middleware
 
-        # Middleware runs in order of group numbers (lower = earlier)
-        # Security middleware first (validate inputs)
-        self.app.add_handler(
-            MessageHandler(
-                filters.ALL, self._create_middleware_handler(security_middleware)
-            ),
-            group=-3,
-        )
+        # (middleware_func, group) pairs. Lower group number runs first.
+        middleware_chain = [
+            (security_middleware, -3),
+            (auth_middleware, -2),
+            (rate_limit_middleware, -1),
+        ]
 
-        # Authentication second
-        self.app.add_handler(
-            MessageHandler(
-                filters.ALL, self._create_middleware_handler(auth_middleware)
-            ),
-            group=-2,
-        )
-
-        # Rate limiting third
-        self.app.add_handler(
-            MessageHandler(
-                filters.ALL, self._create_middleware_handler(rate_limit_middleware)
-            ),
-            group=-1,
-        )
+        for middleware_func, group in middleware_chain:
+            wrapper = self._create_middleware_handler(middleware_func)
+            # Message updates (text, commands, documents, photos, voice, etc.)
+            self.app.add_handler(
+                MessageHandler(filters.ALL, wrapper),
+                group=group,
+            )
+            # Inline-button callback updates. pattern=r".*" matches every
+            # callback_data so the middleware always runs before any
+            # downstream CallbackQueryHandler.
+            self.app.add_handler(
+                CallbackQueryHandler(wrapper, pattern=r".*"),
+                group=group,
+            )
 
         logger.info("Middleware added to bot")
 
@@ -155,6 +168,10 @@ class ClaudeCodeBot:
         When middleware rejects a request (returns without calling the handler),
         ApplicationHandlerStop is raised to prevent subsequent handler groups
         from processing the update.
+
+        For ``callback_query`` updates (inline-button presses), if the
+        middleware rejects the request we also call ``callback_query.answer()``
+        so the Telegram client stops showing the button's loading spinner.
         """
         from telegram.ext import ApplicationHandlerStop
 
@@ -192,6 +209,23 @@ class ClaudeCodeBot:
             # Raise ApplicationHandlerStop to prevent subsequent handler groups
             # (including the main message handlers) from processing this update.
             if not handler_called:
+                # For callback_query updates, clear the pending button state
+                # so the user's Telegram client doesn't show a stuck spinner.
+                callback_query = getattr(update, "callback_query", None)
+                if callback_query is not None:
+                    try:
+                        await callback_query.answer(
+                            "Not authorized or rate limited",
+                            show_alert=False,
+                        )
+                    except Exception:
+                        # Answering is best-effort — failures (e.g. query
+                        # already answered, expired) must not mask the
+                        # underlying rejection.
+                        logger.debug(
+                            "Failed to answer rejected callback_query",
+                            middleware=middleware_func.__name__,
+                        )
                 raise ApplicationHandlerStop()
 
         return middleware_wrapper

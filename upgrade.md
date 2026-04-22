@@ -861,15 +861,15 @@ See R1 + R2 fixes first — they give meaningful single-host headroom.
 
 ### Sprint 1 — 1 week (S-effort, huge impact)
 
-| # | Finding | File | Effort |
-|---|---------|------|--------|
-| 1 | C1 — middleware on callbacks | `src/bot/core.py:127-148` | S |
-| 2 | C2 — `.env.example` defaults | `.env.example:209` + `main.py:118-124` | S |
-| 3 | C3 — audit/tokens → SQLite | `src/main.py:115, 136` | S |
-| 4 | R1 — per-user lock | `src/bot/update_processor.py:38` | S (~30 LOC) |
-| 5 | R2 — WAL + busy_timeout + transactional facade | `src/storage/database.py`, `src/storage/facade.py` | S+M |
-| 6 | H5 — real cost tracking | `src/bot/orchestrator.py:931` | S |
-| 7 | CI: mypy + `poetry check --lock` + SECURITY.md contact + tag-version guard | `.github/workflows/*` | S |
+| # | Finding | File | Effort | Status |
+|---|---------|------|--------|--------|
+| 1 | C1 — middleware on callbacks | `src/bot/core.py:127-148` | S | ✅ done (PR #2) |
+| 2 | C2 — `.env.example` defaults | `.env.example:209` + `main.py:118-124` | S | ⏳ |
+| 3 | C3 — audit/tokens → SQLite | `src/main.py:115, 136` | S | ⏳ |
+| 4 | R1 — per-user lock | `src/bot/update_processor.py:38` | S (~30 LOC) | ⏳ |
+| 5 | R2 — WAL + busy_timeout + transactional facade | `src/storage/database.py`, `src/storage/facade.py` | S+M | ⏳ |
+| 6 | H5 — real cost tracking | `src/bot/orchestrator.py:931` | S | ⏳ |
+| 7 | CI: mypy + `poetry check --lock` + SECURITY.md contact + tag-version guard | `.github/workflows/*` | S | ⏳ |
 
 **Estimated total:** 3–5 focused days.
 
