@@ -267,3 +267,153 @@ def test_estimate_message_cost_handles_none_text() -> None:
     cost = estimate_message_cost(event)
 
     assert cost >= 0.01
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for C1 — middleware must cover callback_query updates.
+# Without these handlers, an unauthorized user who guesses or replays a
+# callback_data string (e.g. stop:<victim_user_id>) reaches the callback
+# handlers bypassing auth / security / rate-limit.
+# See upgrade.md §C1.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_callback_update():
+    """Mock Telegram Update carrying a callback_query (inline-button press)."""
+    update = MagicMock()
+    update.effective_user = MagicMock()
+    update.effective_user.id = 999999
+    update.effective_user.username = "attacker"
+    update.effective_user.is_bot = False
+    # effective_message on a callback update is the message the button sits on
+    update.effective_message = MagicMock()
+    update.effective_message.text = None
+    update.effective_message.document = None
+    update.effective_message.photo = None
+    update.effective_message.reply_text = AsyncMock()
+    update.callback_query = MagicMock()
+    update.callback_query.data = "stop:123456"
+    update.callback_query.answer = AsyncMock()
+    return update
+
+
+class TestMiddlewareCoversCallbackQueries:
+    """C1 regression — middleware must also run on callback_query updates."""
+
+    def test_add_middleware_registers_callback_query_handlers(self, bot):
+        """``_add_middleware`` must register a CallbackQueryHandler at every
+        middleware group alongside the MessageHandler, so inline-button
+        presses go through auth / security / rate-limit."""
+        from telegram.ext import CallbackQueryHandler, MessageHandler
+
+        bot.app = MagicMock()
+        registered: list = []
+
+        def record(handler, group=None):
+            registered.append((handler, group))
+
+        bot.app.add_handler = MagicMock(side_effect=record)
+
+        bot._add_middleware()
+
+        by_group: dict = {}
+        for handler, group in registered:
+            by_group.setdefault(group, []).append(type(handler))
+
+        for group in (-3, -2, -1):
+            assert group in by_group, f"middleware group {group} was not registered"
+            assert (
+                MessageHandler in by_group[group]
+            ), f"group {group} missing MessageHandler registration"
+            assert CallbackQueryHandler in by_group[group], (
+                f"group {group} missing CallbackQueryHandler registration — "
+                "callback_query updates would bypass this middleware"
+            )
+
+    async def test_callback_query_goes_through_wrapper(
+        self, bot, mock_callback_update, mock_context
+    ):
+        """An inline-button press must invoke the middleware function."""
+        middleware_invoked = False
+
+        async def recording_middleware(handler, event, data):
+            nonlocal middleware_invoked
+            middleware_invoked = True
+            return await handler(event, data)
+
+        wrapper = bot._create_middleware_handler(recording_middleware)
+        await wrapper(mock_callback_update, mock_context)
+
+        assert middleware_invoked is True
+
+    async def test_rejected_callback_query_is_answered(
+        self, bot, mock_callback_update, mock_context
+    ):
+        """When middleware blocks a callback update, the wrapper must call
+        ``callback_query.answer()`` so the Telegram client clears the
+        pending-button state — and still raise ApplicationHandlerStop."""
+
+        async def rejecting_middleware(handler, event, data):
+            return  # drop the handler call → rejection
+
+        wrapper = bot._create_middleware_handler(rejecting_middleware)
+
+        with pytest.raises(ApplicationHandlerStop):
+            await wrapper(mock_callback_update, mock_context)
+
+        mock_callback_update.callback_query.answer.assert_awaited_once()
+
+    async def test_rejected_callback_query_answer_failure_is_swallowed(
+        self, bot, mock_callback_update, mock_context
+    ):
+        """If ``callback_query.answer()`` itself fails (e.g. already
+        answered, expired), that error must not mask the original
+        rejection — ApplicationHandlerStop still propagates."""
+        mock_callback_update.callback_query.answer = AsyncMock(
+            side_effect=RuntimeError("query already answered")
+        )
+
+        async def rejecting_middleware(handler, event, data):
+            return
+
+        wrapper = bot._create_middleware_handler(rejecting_middleware)
+
+        with pytest.raises(ApplicationHandlerStop):
+            await wrapper(mock_callback_update, mock_context)
+
+    async def test_accepted_callback_query_not_answered_by_wrapper(
+        self, bot, mock_callback_update, mock_context
+    ):
+        """When middleware allows a callback through, the wrapper must NOT
+        call ``callback_query.answer()`` — the downstream handler owns
+        that responsibility and may want to use ``answer(text=...)``."""
+
+        async def allowing_middleware(handler, event, data):
+            return await handler(event, data)
+
+        wrapper = bot._create_middleware_handler(allowing_middleware)
+        await wrapper(mock_callback_update, mock_context)
+
+        mock_callback_update.callback_query.answer.assert_not_called()
+
+    async def test_real_auth_middleware_rejects_unauthenticated_callback(
+        self, bot, mock_callback_update, mock_context
+    ):
+        """Integration: auth_middleware rejects an unauthenticated user
+        attempting to press a button, and the wrapper answers the
+        callback_query to clear the loading spinner."""
+        from src.bot.middleware.auth import auth_middleware
+
+        auth_manager = MagicMock()
+        auth_manager.is_authenticated.return_value = False
+        auth_manager.authenticate_user = AsyncMock(return_value=False)
+        bot.deps["auth_manager"] = auth_manager
+        bot.deps["audit_logger"] = AsyncMock()
+
+        wrapper = bot._create_middleware_handler(auth_middleware)
+
+        with pytest.raises(ApplicationHandlerStop):
+            await wrapper(mock_callback_update, mock_context)
+
+        mock_callback_update.callback_query.answer.assert_awaited_once()
