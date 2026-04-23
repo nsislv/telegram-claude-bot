@@ -300,3 +300,91 @@ class TestRateLimiter:
         )
         assert allowed is False
         assert "Rate limit exceeded" in message
+
+
+class TestRealCostTracking:
+    """H5 — ``reserve_request`` + ``track_actual_cost`` replace the
+    pre-fix pattern where the rate limiter only ever saw a fake per-
+    request cost of $0.001, letting users burn orders-of-magnitude more
+    Anthropic credit than the daily cap said they could."""
+
+    @pytest.fixture
+    def rate_limiter(self):
+        # max_cost_per_user=1.00 and max_cost_per_request=0.50 so we can
+        # prove the worst-case budget check kicks in on the third call.
+        config = create_test_config(
+            claude_max_cost_per_user=1.0,
+            claude_max_cost_per_request=0.5,
+            rate_limit_burst=20,
+            rate_limit_requests=20,
+        )
+        return RateLimiter(config)
+
+    async def test_reserve_request_does_not_mutate_cost(self, rate_limiter):
+        user_id = 1
+        allowed, _ = await rate_limiter.reserve_request(user_id, worst_case_cost=0.5)
+        assert allowed is True
+        # No cost is reserved — tracking happens AFTER the response lands.
+        assert rate_limiter.cost_tracker[user_id] == 0.0
+
+    async def test_reserve_request_rejects_when_worst_case_exceeds_cap(
+        self, rate_limiter
+    ):
+        user_id = 1
+        # Pretend two real calls already landed, using ~$0.60 of the $1.00
+        # daily cap (well under the cap).
+        await rate_limiter.track_actual_cost(user_id, 0.6)
+
+        # A third call's worst case is $0.50 → 0.60 + 0.50 > 1.00 → reject.
+        allowed, message = await rate_limiter.reserve_request(
+            user_id, worst_case_cost=0.5
+        )
+        assert allowed is False
+        assert "Cost limit exceeded" in message
+
+    async def test_track_actual_cost_accumulates(self, rate_limiter):
+        user_id = 1
+        await rate_limiter.track_actual_cost(user_id, 0.15)
+        await rate_limiter.track_actual_cost(user_id, 0.05)
+        assert rate_limiter.cost_tracker[user_id] == pytest.approx(0.20)
+
+    async def test_track_actual_cost_ignores_non_positive(self, rate_limiter):
+        """A zero- or negative-cost response should not bump the tracker
+        (protects against degenerate SDK responses)."""
+        user_id = 1
+        await rate_limiter.track_actual_cost(user_id, 0.0)
+        await rate_limiter.track_actual_cost(user_id, -1.0)
+        assert rate_limiter.cost_tracker[user_id] == 0.0
+
+    async def test_full_reserve_then_track_flow(self, rate_limiter):
+        """The whole point of H5: pre-check uses worst-case, post-call
+        records actual. Eight small real costs should be admitted even
+        though each call's worst-case is $0.50 — because the tracker
+        reflects the real numbers, not the estimates."""
+        user_id = 1
+        actual_cost_per_call = 0.05  # Real billed amount
+
+        admitted = 0
+        for _ in range(8):
+            allowed, _ = await rate_limiter.reserve_request(
+                user_id, worst_case_cost=0.5
+            )
+            if not allowed:
+                break
+            admitted += 1
+            await rate_limiter.track_actual_cost(user_id, actual_cost_per_call)
+
+        # With real-cost tracking: 8 calls × $0.05 = $0.40 tracked.
+        # Ninth would be $0.40 + $0.50 worst-case = $0.90, still <$1.00 cap.
+        # So at least 8 should have landed.
+        assert admitted == 8
+        assert rate_limiter.cost_tracker[user_id] == pytest.approx(0.4)
+
+        # The call AFTER we cross $0.50 tracked should be rejected on
+        # the worst-case check.
+        await rate_limiter.track_actual_cost(user_id, 0.15)  # tracker = 0.55
+        allowed, message = await rate_limiter.reserve_request(
+            user_id, worst_case_cost=0.5
+        )
+        assert allowed is False
+        assert "Cost limit exceeded" in message

@@ -925,10 +925,17 @@ class MessageOrchestrator:
             message_length=len(message_text),
         )
 
-        # Rate limit check
+        # Rate limit + budget pre-check. The ``reserve_request`` path
+        # uses the real per-request ceiling (``claude_max_cost_per_request``)
+        # as the worst-case so we reject if the user is one big call away
+        # from blowing their daily cap. The actual billed cost is recorded
+        # via ``track_actual_cost`` after the response lands.
         rate_limiter = context.bot_data.get("rate_limiter")
         if rate_limiter:
-            allowed, limit_message = await rate_limiter.check_rate_limit(user_id, 0.001)
+            worst_case = self.settings.claude_max_cost_per_request
+            allowed, limit_message = await rate_limiter.reserve_request(
+                user_id, worst_case_cost=worst_case
+            )
             if not allowed:
                 await update.message.reply_text(f"⏱️ {limit_message}")
                 return
@@ -1042,6 +1049,20 @@ class MessageOrchestrator:
                     )
                 except Exception as e:
                     logger.warning("Failed to log interaction", error=str(e))
+
+            # Record the real billed cost in the in-memory rate
+            # limiter so the next ``reserve_request`` check has accurate
+            # numbers. The DB is already updated via
+            # ``save_claude_interaction`` above.
+            if rate_limiter and claude_response.cost:
+                try:
+                    await rate_limiter.track_actual_cost(user_id, claude_response.cost)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to track actual cost in rate limiter",
+                        user_id=user_id,
+                        error=str(e),
+                    )
 
             # Format response (no reply_markup — strip keyboards)
             from .utils.formatting import ResponseFormatter

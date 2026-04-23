@@ -123,6 +123,82 @@ class RateLimiter:
             )
             return True, None
 
+    async def reserve_request(
+        self,
+        user_id: int,
+        worst_case_cost: float,
+        tokens: int = 1,
+    ) -> Tuple[bool, Optional[str]]:
+        """Admit a request after a real-cost-aware budget check.
+
+        Replacement for the H5 pattern where the pre-request call to
+        ``check_rate_limit(user_id, 0.001)`` tracked a fake cost of
+        $0.001 per request while the billed Anthropic cost could be
+        orders of magnitude larger. With ``claude_max_cost_per_user``
+        of $10.00 and fake tracking, a user could burn $500+ of API
+        credit before the budget check tripped.
+
+        This method:
+
+        1. Consumes one token from the per-user rate bucket (wait-time
+           feedback on the message when denied).
+        2. Refuses admission if the user's *already-tracked* daily cost
+           plus the caller-supplied ``worst_case_cost`` (use
+           ``settings.claude_max_cost_per_request``) exceeds
+           ``claude_max_cost_per_user``.
+        3. Does **not** mutate ``cost_tracker``. The caller must record
+           the real billed cost via :meth:`track_actual_cost` once the
+           Claude response returns.
+        """
+        async with self.locks[user_id]:
+            rate_allowed, rate_message = self._check_request_rate(user_id, tokens)
+            if not rate_allowed:
+                logger.warning(
+                    "Request rate limit exceeded",
+                    user_id=user_id,
+                    tokens_requested=tokens,
+                )
+                return False, rate_message
+
+            budget_allowed, budget_message = self._check_cost_limit(
+                user_id, worst_case_cost
+            )
+            if not budget_allowed:
+                logger.warning(
+                    "Budget cap would be exceeded by worst-case request",
+                    user_id=user_id,
+                    worst_case_cost=worst_case_cost,
+                    current_usage=self.cost_tracker[user_id],
+                )
+                return False, budget_message
+
+            # Consume a rate token but do NOT mutate cost here — real
+            # cost is tracked after the response lands.
+            self._consume_request_tokens(user_id, tokens)
+            return True, None
+
+    async def track_actual_cost(self, user_id: int, cost: float) -> None:
+        """Record the **real** billed cost after a Claude call.
+
+        Pair with :meth:`reserve_request`. Kept minimal and
+        non-failing — if anything goes wrong we log and move on rather
+        than break the message flow (the response is already delivered
+        to the user by the time this runs).
+        """
+        if cost <= 0:
+            return
+        async with self.locks[user_id]:
+            # Apply the daily reset first so we do not add cost to a
+            # yesterday-tracker that's about to be wiped.
+            self._maybe_reset_cost_tracker(user_id)
+            self._track_cost(user_id, cost)
+            logger.info(
+                "Actual Claude cost tracked",
+                user_id=user_id,
+                cost=cost,
+                total_usage=self.cost_tracker[user_id],
+            )
+
     def _check_request_rate(
         self, user_id: int, tokens: int
     ) -> Tuple[bool, Optional[str]]:
