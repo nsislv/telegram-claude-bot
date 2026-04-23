@@ -194,13 +194,18 @@ class SQLiteTokenStorage(TokenStorage):
             return None
 
         # Touch last_used so audit traces can show when a token was
-        # presented to the bot. Best-effort — failures must not block auth.
+        # presented to the bot. Best-effort — failures must not block
+        # auth. Log at ``warning`` rather than ``debug`` (review
+        # feedback): the default LOG_LEVEL is INFO, so a silent
+        # ``debug`` would hide a persistent DB write failure that the
+        # operator should know about.
         try:
             if token.token_id is not None:
                 await self.repository.touch_last_used(token.token_id)
         except Exception:  # pragma: no cover — defensive
-            logger.debug(
-                "Failed to update last_used timestamp",
+            logger.warning(
+                "Failed to update last_used timestamp — token auth "
+                "still succeeded but DB writes may be failing",
                 user_id=user_id,
                 token_id=token.token_id,
             )

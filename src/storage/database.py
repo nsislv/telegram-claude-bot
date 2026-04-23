@@ -12,7 +12,7 @@ import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, List, Tuple
+from typing import AsyncIterator, Awaitable, Callable, List, Tuple, Union
 
 import aiosqlite
 import structlog
@@ -169,7 +169,21 @@ class DatabaseManager:
         logger.info("Database initialization complete")
 
     async def _run_migrations(self):
-        """Run database migrations."""
+        """Run database migrations.
+
+        Each migration entry is either:
+
+        - a SQL string (passed to ``executescript``, which auto-commits
+          per statement block); or
+        - an async callable ``async def(conn) -> None`` that the runner
+          invokes with the shared connection. Callable migrations are
+          wrapped in ``BEGIN IMMEDIATE`` / ``COMMIT`` so multi-step
+          schema rewrites either apply fully or not at all — important
+          for migration 5's table-rebuild (review feedback on PR #8:
+          a process kill between ``DROP TABLE audit_log`` and
+          ``ALTER TABLE … RENAME`` left the DB with no ``audit_log``
+          and required manual recovery).
+        """
         async with aiosqlite.connect(
             self.database_path, detect_types=sqlite3.PARSE_DECLTYPES
         ) as conn:
@@ -187,8 +201,29 @@ class DatabaseManager:
             for version, migration in migrations:
                 if version > current_version:
                     logger.info("Running migration", version=version)
-                    await conn.executescript(migration)
-                    await self._set_schema_version(conn, version)
+                    if callable(migration):
+                        # Atomic migration: wrap the callable + the
+                        # version-stamp in one transaction so a crash
+                        # during the rewrite leaves the DB exactly as
+                        # it was before the migration started.
+                        # ``commit()`` first to flush any pending
+                        # implicit transaction aiosqlite may have
+                        # opened during an earlier migration step —
+                        # ``BEGIN IMMEDIATE`` errors with
+                        # ``cannot start a transaction within a
+                        # transaction`` otherwise.
+                        await conn.commit()
+                        await conn.execute("BEGIN IMMEDIATE")
+                        try:
+                            await migration(conn)
+                            await self._set_schema_version(conn, version)
+                            await conn.commit()
+                        except Exception:
+                            await conn.rollback()
+                            raise
+                    else:
+                        await conn.executescript(migration)
+                        await self._set_schema_version(conn, version)
 
             await conn.commit()
 
@@ -212,7 +247,56 @@ class DatabaseManager:
             "INSERT INTO schema_version (version) VALUES (?)", (version,)
         )
 
-    def _get_migrations(self) -> List[Tuple[int, str]]:
+    async def _migration_5_drop_audit_log_user_fk(
+        self, conn: aiosqlite.Connection
+    ) -> None:
+        """Atomic variant of migration 5.
+
+        SQLite cannot drop a FK in place, so we rebuild the table
+        and rename. Every step runs via ``execute`` (not
+        ``executescript``) inside the outer transaction opened by
+        ``_run_migrations`` so the whole rewrite is atomic — a
+        process kill mid-way leaves the pre-migration schema intact
+        and the next startup retries cleanly.
+        """
+        await conn.execute(
+            """
+            CREATE TABLE audit_log_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                event_data JSON,
+                success BOOLEAN DEFAULT TRUE,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                ip_address TEXT
+            )
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO audit_log_new
+                (id, user_id, event_type, event_data, success,
+                 timestamp, ip_address)
+            SELECT id, user_id, event_type, event_data, success,
+                   timestamp, ip_address
+            FROM audit_log
+            """
+        )
+        await conn.execute("DROP TABLE audit_log")
+        await conn.execute("ALTER TABLE audit_log_new RENAME TO audit_log")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_user_id " "ON audit_log(user_id)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp "
+            "ON audit_log(timestamp)"
+        )
+
+    def _get_migrations(
+        self,
+    ) -> List[
+        Tuple[int, Union[str, Callable[[aiosqlite.Connection], Awaitable[None]]]]
+    ]:
         """Get migration scripts."""
         return [
             (1, INITIAL_SCHEMA),
@@ -310,41 +394,11 @@ class DatabaseManager:
                     ON project_threads(project_slug);
                 """,
             ),
-            (
-                5,
-                # Drop the FOREIGN KEY on audit_log.user_id. Audit records
-                # must be writable for any user_id — including first-contact
-                # authentication attempts where the users row has not yet
-                # been created, and including malicious or rejected IDs we
-                # want to preserve for forensics. SQLite cannot drop a
-                # constraint in place, so recreate the table and copy rows.
-                """
-                CREATE TABLE audit_log_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    event_type TEXT NOT NULL,
-                    event_data JSON,
-                    success BOOLEAN DEFAULT TRUE,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    ip_address TEXT
-                );
-
-                INSERT INTO audit_log_new
-                    (id, user_id, event_type, event_data, success,
-                     timestamp, ip_address)
-                SELECT id, user_id, event_type, event_data, success,
-                       timestamp, ip_address
-                FROM audit_log;
-
-                DROP TABLE audit_log;
-                ALTER TABLE audit_log_new RENAME TO audit_log;
-
-                CREATE INDEX IF NOT EXISTS idx_audit_log_user_id
-                    ON audit_log(user_id);
-                CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
-                    ON audit_log(timestamp);
-                """,
-            ),
+            # Migration 5 is a callable so the rebuild is atomic.
+            # See ``_migration_5_drop_audit_log_user_fk`` for why —
+            # PR #8 review feedback on the original ``executescript``
+            # version.
+            (5, self._migration_5_drop_audit_log_user_fk),
         ]
 
     async def _init_pool(self):

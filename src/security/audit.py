@@ -153,16 +153,21 @@ class SQLiteAuditStorage(AuditStorage):
         """Translate ``AuditEvent`` into the storage-layer ``AuditLogModel``.
 
         ``AuditLogModel`` does not have a native place for session_id or
-        risk_level, so both are folded into ``event_data`` alongside the
-        caller-supplied ``details`` dict. Keys are namespaced with an
-        underscore so they don't collide with caller keys.
+        risk_level, so both are folded into ``event_data`` under a
+        single ``_meta`` sub-dict to avoid collision with caller keys.
+        Review feedback: the previous ``_session_id`` / ``_risk_level``
+        top-level keys could be silently overwritten by a caller passing
+        ``details={"_session_id": "spoofed"}``; the nested ``_meta``
+        namespace removes that footgun without growing the schema.
         """
         # Import here to avoid a circular import at module load time.
         from src.storage.models import AuditLogModel
 
         event_data: Dict[str, Any] = dict(event.details or {})
-        event_data["_session_id"] = event.session_id
-        event_data["_risk_level"] = event.risk_level
+        event_data["_meta"] = {
+            "session_id": event.session_id,
+            "risk_level": event.risk_level,
+        }
 
         return AuditLogModel(
             user_id=event.user_id,
@@ -176,8 +181,18 @@ class SQLiteAuditStorage(AuditStorage):
     def _model_to_event(self, model: "AuditLogModel") -> AuditEvent:
         """Reverse of :meth:`_event_to_model` for read paths."""
         event_data = dict(model.event_data or {})
-        session_id = event_data.pop("_session_id", None)
-        risk_level = event_data.pop("_risk_level", "low") or "low"
+        # Back-compat read path — accept both the new nested
+        # ``_meta`` dict and the pre-fix flat ``_session_id`` /
+        # ``_risk_level`` keys. Rows written by an earlier version
+        # of SQLiteAuditStorage must still be deserialisable after
+        # this upgrade.
+        meta = event_data.pop("_meta", None)
+        if isinstance(meta, dict):
+            session_id = meta.get("session_id")
+            risk_level = meta.get("risk_level") or "low"
+        else:
+            session_id = event_data.pop("_session_id", None)
+            risk_level = event_data.pop("_risk_level", "low") or "low"
 
         return AuditEvent(
             timestamp=model.timestamp,

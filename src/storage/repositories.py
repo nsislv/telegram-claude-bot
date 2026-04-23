@@ -665,32 +665,54 @@ class UserTokenRepository:
         self.db = db_manager
 
     async def upsert_active(self, token: UserTokenModel) -> int:
-        """Deactivate any prior token for the user and insert a new one.
+        """Atomically deactivate any prior token and insert a new one.
+
+        Wrapped in ``BEGIN IMMEDIATE`` so concurrent calls for the
+        same ``user_id`` serialise on SQLite's reserved write lock:
+        without it, two concurrent ``store_token`` calls could each
+        run their UPDATE + INSERT, leaving two ``is_active=1`` rows
+        and violating the "one active token per user" invariant.
+        Review feedback on PR #8.
 
         Returns the ``token_id`` of the newly inserted row.
         """
         async with self.db.get_connection() as conn:
-            await conn.execute(
-                "UPDATE user_tokens SET is_active = 0 WHERE user_id = ?",
-                (token.user_id,),
-            )
-            cursor = await conn.execute(
-                """
-                INSERT INTO user_tokens
-                (user_id, token_hash, created_at, expires_at, last_used, is_active)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    token.user_id,
-                    token.token_hash,
-                    token.created_at,
-                    token.expires_at,
-                    token.last_used,
-                    token.is_active,
-                ),
-            )
+            # ``BEGIN IMMEDIATE`` takes the reserved write lock
+            # up-front, so the busy_timeout (R2) kicks in cleanly
+            # on contention instead of late-mid-transaction.
+            # ``commit()`` first to flush any pending implicit
+            # transaction aiosqlite may have opened; without this,
+            # explicit ``BEGIN IMMEDIATE`` raises "cannot start a
+            # transaction within a transaction" on a recycled
+            # connection.
             await conn.commit()
-            return cursor.lastrowid
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                await conn.execute(
+                    "UPDATE user_tokens SET is_active = 0 WHERE user_id = ?",
+                    (token.user_id,),
+                )
+                cursor = await conn.execute(
+                    """
+                    INSERT INTO user_tokens
+                    (user_id, token_hash, created_at, expires_at,
+                     last_used, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        token.user_id,
+                        token.token_hash,
+                        token.created_at,
+                        token.expires_at,
+                        token.last_used,
+                        token.is_active,
+                    ),
+                )
+                await conn.commit()
+                return cursor.lastrowid
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def get_active_for_user(self, user_id: int) -> Optional[UserTokenModel]:
         """Return the user's active token, or None if none / expired.
