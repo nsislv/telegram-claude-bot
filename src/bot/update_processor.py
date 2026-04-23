@@ -12,6 +12,11 @@ could freeze the bot for up to ``claude_timeout_seconds`` for everyone.)
 
 Priority callbacks (``stop:*``) always bypass user locks so the user can
 interrupt their own running handler.
+
+This module is also the single chokepoint where every inbound update is
+tagged with a correlation id (R5) — binding here means every structlog
+call downstream (middleware, handlers, storage, Claude SDK) automatically
+carries ``request_id`` and ``user_id`` until the update's task finishes.
 """
 
 import asyncio
@@ -20,6 +25,8 @@ from typing import Any, Awaitable, Dict, Hashable, Optional
 
 from telegram import Update
 from telegram.ext._baseupdateprocessor import BaseUpdateProcessor
+
+from src.utils.correlation import request_context
 
 
 class StopAwareUpdateProcessor(BaseUpdateProcessor):
@@ -79,20 +86,43 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
             return cls._NO_USER_KEY
         return user.id
 
+    @staticmethod
+    def _extract_user_id(update: object) -> Optional[int]:
+        """Return ``update.effective_user.id`` if present, else ``None``.
+
+        Used to stamp ``user_id`` into the correlation context for
+        structured logging. Distinct from :meth:`_lock_key` — the lock
+        key falls back to a sentinel string for userless updates, while
+        the correlation stamp uses ``None`` to mean "no user known".
+        """
+        if not isinstance(update, Update):
+            return None
+        user = update.effective_user
+        return user.id if user is not None else None
+
     async def do_process_update(
         self,
         update: object,
         coroutine: Awaitable[Any],
     ) -> None:
-        """Process an update, serializing by user for non-priority updates."""
-        if self._is_priority_callback(update):
-            # Run immediately -- no user lock
-            await coroutine
-            return
+        """Process an update, serializing by user for non-priority updates.
 
-        key = self._lock_key(update)
-        async with self._user_locks[key]:
-            await coroutine
+        Every update — priority callback or regular — runs inside a
+        ``request_context`` so a fresh correlation id is bound to
+        structlog (plus ``user_id`` when the update has one) for the
+        lifetime of the handler chain. Downstream logs stamp both
+        values automatically.
+        """
+        user_id = self._extract_user_id(update)
+        async with request_context(user_id=user_id):
+            if self._is_priority_callback(update):
+                # Run immediately -- no user lock
+                await coroutine
+                return
+
+            key = self._lock_key(update)
+            async with self._user_locks[key]:
+                await coroutine
 
     # ------------------------------------------------------------------
     # Introspection used by tests / future metrics
