@@ -26,7 +26,12 @@ from src.exceptions import ConfigurationError
 from src.notifications.service import NotificationService
 from src.projects import ProjectThreadManager, load_project_registry
 from src.scheduler.scheduler import JobScheduler
-from src.security.audit import AuditLogger, SQLiteAuditStorage
+from src.security.audit import (
+    AuditLogger,
+    CompositeAuditStorage,
+    JsonlAuditStorage,
+    SQLiteAuditStorage,
+)
 from src.security.auth import (
     AuthenticationManager,
     SQLiteTokenStorage,
@@ -273,8 +278,22 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     )
     rate_limiter = RateLimiter(config)
 
-    # Create audit storage and logger (SQLite-backed, durable).
-    audit_storage = SQLiteAuditStorage(storage.audit)
+    # Create audit storage. Primary is SQLite (queryable, durable).
+    # When ``AUDIT_LOG_PATH`` is set, also fan out writes to an
+    # append-only JSONL file for tamper-evident forensic durability —
+    # a ``logrotate`` + log-forwarder pipeline ships the file off-host
+    # so an attacker with DB access cannot cover their tracks by
+    # dropping SQLite rows.
+    primary_audit: Any = SQLiteAuditStorage(storage.audit)
+    if config.audit_log_path is not None:
+        jsonl_sink = JsonlAuditStorage(config.audit_log_path)
+        audit_storage = CompositeAuditStorage(primary_audit, jsonl_sink)
+        logger.info(
+            "Append-only audit sink enabled",
+            path=str(config.audit_log_path),
+        )
+    else:
+        audit_storage = primary_audit
     audit_logger = AuditLogger(audit_storage)
 
     # Create Claude integration components with persistent storage

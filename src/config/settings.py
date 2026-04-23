@@ -205,6 +205,20 @@ class Settings(BaseSettings):
             "disables persistence (legacy behaviour)."
         ),
     )
+    # Optional tamper-evident append-only audit sink. Writes every
+    # AuditEvent to a JSONL file in parallel with SQLite. Intended
+    # for forensic durability — a ``logrotate`` + log-forwarder
+    # pipeline ships the file off-host so an attacker with DB
+    # access cannot cover their tracks by dropping SQLite rows.
+    audit_log_path: Optional[Path] = Field(
+        None,
+        description=(
+            "Path to an append-only JSONL audit log. When set, the "
+            "AuditLogger writes to both SQLite (queryable) and this "
+            "file (forensic durability). Leave unset to keep SQLite-"
+            "only behaviour."
+        ),
+    )
     session_timeout_hours: int = Field(
         DEFAULT_SESSION_TIMEOUT_HOURS, description="Session timeout"
     )

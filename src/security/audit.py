@@ -5,11 +5,14 @@ Features:
 - Command execution
 - File access
 - Security violations
+- Optional append-only JSONL sink for tamper-evident forensics
 """
 
+import asyncio
 import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
@@ -243,6 +246,259 @@ class SQLiteAuditStorage(AuditStorage):
         return await self.get_events(
             user_id=user_id, event_type="security_violation", limit=limit
         )
+
+
+class JsonlAuditStorage(AuditStorage):
+    """Append-only JSONL audit sink.
+
+    A forensic durability layer on top of the queryable SQLite
+    storage. SQLite is convenient to read but a DBA with filesystem
+    access can drop rows, modify the file, or corrupt it. An
+    append-only JSONL file with restrictive Unix perms (640) and
+    ideally shipped off-host by an external log forwarder is much
+    harder to tamper with:
+
+    - New events always land at the end of the file (O_APPEND guards
+      against racing writers interleaving within a single line).
+    - ``fsync()`` after each event means a post-incident forensic
+      read gets every event the bot believed it had logged at
+      crash time.
+    - The file is opened once and kept open for the process
+      lifetime; we rely on the operator to run ``logrotate`` or
+      equivalent to cap growth (rotated files stay readable via
+      :meth:`get_events`).
+
+    Queries are linear scans of the file. That's acceptable because
+    the queryable path is :class:`SQLiteAuditStorage`; this sink
+    exists for the ``auditctl``-style read-the-JSON-after-an-incident
+    workflow.
+    """
+
+    def __init__(self, path: "Path", fsync_each_write: bool = True) -> None:
+        # Import locally so the core module does not gain a hard
+        # dependency on ``pathlib`` for the common in-memory path.
+        from pathlib import Path as _Path
+
+        if not isinstance(path, _Path):
+            path = _Path(path)  # type: ignore[assignment]
+
+        self.path = path
+        self._fsync_each_write = fsync_each_write
+        self._lock = asyncio.Lock()
+        self._fh: Optional[Any] = None
+
+    async def _ensure_open(self) -> Any:
+        if self._fh is not None and not self._fh.closed:
+            return self._fh
+        # Make the parent directory on first write rather than at
+        # construction — tests instantiate with a temp path that may
+        # not exist yet.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # ``a+`` so we can both append and later read. Line-buffered so
+        # each write reaches the OS even before fsync.
+        self._fh = open(self.path, "a+", buffering=1, encoding="utf-8")
+        # Best-effort tighten perms. ``chmod`` is a no-op on Windows
+        # filesystems that don't support Unix perms; we log and
+        # continue rather than fail.
+        try:
+            import os
+
+            os.chmod(self.path, 0o640)
+        except (OSError, NotImplementedError):
+            logger.debug(
+                "Could not chmod audit log (non-POSIX fs?)", path=str(self.path)
+            )
+        return self._fh
+
+    async def store_event(self, event: AuditEvent) -> None:
+        """Append one JSON line per event, then fsync."""
+        async with self._lock:
+            fh = await self._ensure_open()
+            # ``event.to_json`` handles datetime serialisation.
+            fh.write(event.to_json())
+            fh.write("\n")
+            fh.flush()
+            if self._fsync_each_write:
+                try:
+                    import os
+
+                    os.fsync(fh.fileno())
+                except OSError:
+                    # fsync can fail on some filesystems / pipes —
+                    # the line is already in the OS buffer, and log
+                    # forwarders will pick it up.
+                    logger.debug("fsync failed on audit log", path=str(self.path))
+
+        if event.risk_level in ("high", "critical"):
+            logger.warning(
+                "High-risk security event",
+                event_type=event.event_type,
+                user_id=event.user_id,
+                risk_level=event.risk_level,
+                details=event.details,
+            )
+
+    def _iter_events(self) -> "Iterator[AuditEvent]":  # noqa: F821
+        """Read every event from the file in append order.
+
+        Generator — callers apply filters without materialising the
+        whole list. Malformed lines (truncated writes after a crash)
+        are skipped with a log line rather than raising.
+        """
+        from typing import Iterator  # noqa: F401
+
+        if not self.path.exists():
+            return iter(())
+
+        def _gen() -> Any:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                for lineno, line in enumerate(fh, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Skipping malformed audit line",
+                            path=str(self.path),
+                            lineno=lineno,
+                        )
+                        continue
+                    try:
+                        data["timestamp"] = datetime.fromisoformat(data["timestamp"])
+                    except (KeyError, TypeError, ValueError):
+                        # Keep the line even if the timestamp is
+                        # broken — the rest of the event is still
+                        # useful forensic data. Drop to a sentinel so
+                        # comparison-based filters still work.
+                        data["timestamp"] = datetime.now(UTC)
+                    yield AuditEvent(**data)
+
+        return _gen()
+
+    async def get_events(
+        self,
+        user_id: Optional[int] = None,
+        event_type: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: int = 100,
+    ) -> List[AuditEvent]:
+        """Linear scan with post-filter. Used by admin-only code paths."""
+        matches: List[AuditEvent] = []
+        for event in self._iter_events():
+            if user_id is not None and event.user_id != user_id:
+                continue
+            if event_type is not None and event.event_type != event_type:
+                continue
+            if start_time is not None and event.timestamp < start_time:
+                continue
+            if end_time is not None and event.timestamp > end_time:
+                continue
+            matches.append(event)
+
+        matches.sort(key=lambda e: e.timestamp, reverse=True)
+        return matches[:limit]
+
+    async def get_security_violations(
+        self, user_id: Optional[int] = None, limit: int = 100
+    ) -> List[AuditEvent]:
+        return await self.get_events(
+            user_id=user_id, event_type="security_violation", limit=limit
+        )
+
+    async def close(self) -> None:
+        async with self._lock:
+            if self._fh is not None and not self._fh.closed:
+                try:
+                    self._fh.flush()
+                    import os
+
+                    os.fsync(self._fh.fileno())
+                except OSError:
+                    pass
+                self._fh.close()
+            self._fh = None
+
+
+class CompositeAuditStorage(AuditStorage):
+    """Fan-out wrapper that writes to every backend and reads from the
+    first.
+
+    The ``primary`` backend (first argument) is the source of truth
+    for queries — typically :class:`SQLiteAuditStorage` because it
+    indexes by user and timestamp. Additional backends (e.g.
+    :class:`JsonlAuditStorage`) are tamper-evident durable sinks;
+    their write errors are logged but never propagated, so a failing
+    forensic sink cannot break the auth / security flow on the hot
+    path.
+
+    A post-incident workflow:
+
+        SQLite dropped / corrupted / tampered?
+        -> read the JSONL file (or its logrotated copies)
+        -> reconstruct the full event history.
+    """
+
+    def __init__(
+        self,
+        primary: AuditStorage,
+        *secondary: AuditStorage,
+    ) -> None:
+        self.primary = primary
+        self.secondary = secondary
+
+    async def store_event(self, event: AuditEvent) -> None:
+        """Write to all backends; failures in secondaries get logged."""
+        # Primary MUST succeed — it's the queryable store. Any error
+        # here propagates to the caller.
+        await self.primary.store_event(event)
+
+        for backend in self.secondary:
+            try:
+                await backend.store_event(event)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Secondary audit backend failed to store event",
+                    backend=type(backend).__name__,
+                    error=str(exc),
+                    event_type=event.event_type,
+                )
+
+    async def get_events(
+        self,
+        user_id: Optional[int] = None,
+        event_type: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: int = 100,
+    ) -> List[AuditEvent]:
+        return await self.primary.get_events(
+            user_id=user_id,
+            event_type=event_type,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+
+    async def get_security_violations(
+        self, user_id: Optional[int] = None, limit: int = 100
+    ) -> List[AuditEvent]:
+        return await self.primary.get_security_violations(user_id=user_id, limit=limit)
+
+    async def close(self) -> None:
+        for backend in (self.primary, *self.secondary):
+            close = getattr(backend, "close", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Audit backend close raised",
+                        backend=type(backend).__name__,
+                        error=str(exc),
+                    )
 
 
 class AuditLogger:
