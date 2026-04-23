@@ -1253,6 +1253,28 @@ class MessageOrchestrator:
         if not file_handler:
             file = await document.get_file()
             file_bytes = await file.download_as_bytearray()
+
+            # M6 — now that we have the bytes, run the magic-byte
+            # validation. Executable uploads and extension/content
+            # mismatches get rejected here with an audit trail; a
+            # security_validator is required for this check, which
+            # matches the earlier filename-only validation gate
+            # higher up in this method.
+            audit_logger = context.bot_data.get("audit_logger")
+            if security_validator is not None:
+                from ..bot.middleware.security import validate_file_upload
+
+                ok, err = await validate_file_upload(
+                    document,
+                    security_validator,
+                    user_id,
+                    audit_logger,
+                    file_bytes=bytes(file_bytes),
+                )
+                if not ok:
+                    await progress_msg.edit_text(f"File rejected: {err}")
+                    return
+
             try:
                 content = file_bytes.decode("utf-8")
                 if len(content) > 50000:

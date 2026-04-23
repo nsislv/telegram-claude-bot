@@ -767,6 +767,33 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             file = await document.get_file()
             file_bytes = await file.download_as_bytearray()
 
+            # M6 — run the magic-byte validation on the downloaded
+            # bytes so a PE binary renamed ``notes.txt`` gets
+            # rejected here with an audit trail, instead of being
+            # dumped into a prompt. ``security_validator`` is the
+            # same one the metadata-only ``validate_file_upload``
+            # ran with earlier in the middleware chain.
+            audit_logger_svc = context.bot_data.get("audit_logger")
+            security = context.bot_data.get("security_validator")
+            if security is not None:
+                from ..middleware.security import validate_file_upload
+
+                ok, err = await validate_file_upload(
+                    document,
+                    security,
+                    user_id,
+                    audit_logger_svc,
+                    file_bytes=bytes(file_bytes),
+                )
+                if not ok:
+                    await progress_msg.edit_text(
+                        "❌ <b>File Upload Blocked</b>\n\n"
+                        f"{escape_html(err)}\n\n"
+                        "Please ensure your file meets security requirements.",
+                        parse_mode="HTML",
+                    )
+                    return
+
             # Try to decode as text
             try:
                 content = file_bytes.decode("utf-8")
