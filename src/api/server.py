@@ -9,10 +9,12 @@ from typing import Any, Dict, Optional
 
 import structlog
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 
 from ..config.settings import Settings
 from ..events.bus import EventBus
 from ..events.types import WebhookEvent
+from ..observability import bot_metrics, render_prometheus
 from ..storage.database import DatabaseManager
 from .auth import verify_github_signature, verify_shared_secret
 
@@ -36,6 +38,28 @@ def create_api_app(
     @app.get("/health")
     async def health_check() -> Dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics() -> PlainTextResponse:
+        """Prometheus text-format exposition (R5).
+
+        Scrape target for operators running Prometheus / Grafana /
+        alertmanager. Returns ``text/plain; version=0.0.4; charset=utf-8``
+        per the exposition spec. Includes bot-specific counters
+        (messages received, Claude calls by outcome, rate-limit
+        rejections), a Claude-latency histogram, a DB-query-latency
+        histogram, and an active-sessions gauge.
+
+        Unauthenticated by design — metrics are meant to be scraped
+        behind the reverse proxy / Prometheus ACL. If the endpoint is
+        exposed to the public internet, operators should front it with
+        a TLS-terminating proxy that filters by source IP.
+        """
+        body = await render_prometheus(bot_metrics.registry)
+        return PlainTextResponse(
+            content=body,
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     @app.post("/webhooks/{provider}")
     async def receive_webhook(

@@ -30,6 +30,7 @@ from telegram.ext import (
 
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
+from ..observability import bot_metrics
 from ..projects import PrivateTopicsUnavailableError
 
 # Secret-redaction patterns live in ``src.utils.redaction`` so the
@@ -919,6 +920,12 @@ class MessageOrchestrator:
             message_length=len(message_text),
         )
 
+        # R5 — bump the received-messages counter before the rate-limit
+        # gate so we can see the full inbound volume in /metrics and
+        # compare it against the ``rate_limit_rejections`` counter
+        # below to spot noisy users quickly.
+        await bot_metrics.messages_received_total.inc()
+
         # Rate limit + budget pre-check. The ``reserve_request`` path
         # uses the real per-request ceiling (``claude_max_cost_per_request``)
         # as the worst-case so we reject if the user is one big call away
@@ -931,6 +938,7 @@ class MessageOrchestrator:
                 user_id, worst_case_cost=worst_case
             )
             if not allowed:
+                await bot_metrics.rate_limit_rejections_total.inc(reason="rate")
                 await update.message.reply_text(f"⏱️ {limit_message}")
                 return
 
@@ -1005,6 +1013,12 @@ class MessageOrchestrator:
         # Independent typing heartbeat — stays alive even with no stream events
         heartbeat = self._start_typing_heartbeat(chat)
 
+        # R5 — snapshot monotonic time around the Claude call so the
+        # ``bot_claude_latency_seconds`` histogram reflects wall-clock
+        # latency regardless of branch taken inside the try/except.
+        claude_call_started = time.monotonic()
+        claude_outcome = "error"  # overwritten on success / interrupt
+
         success = True
         try:
             claude_response = await claude_integration.run_command(
@@ -1070,9 +1084,11 @@ class MessageOrchestrator:
                 ) + "\n\n_(Interrupted by user)_"
 
             formatted_messages = formatter.format_claude_response(response_content)
+            claude_outcome = "interrupted" if claude_response.interrupted else "success"
 
         except Exception as e:
             success = False
+            claude_outcome = "error"
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
             from .handlers.message import _format_error_message
             from .utils.formatting import FormattedMessage
@@ -1081,6 +1097,17 @@ class MessageOrchestrator:
                 FormattedMessage(_format_error_message(e), parse_mode="HTML")
             ]
         finally:
+            # Record metrics regardless of branch taken. Wrapped in a
+            # try so a metrics failure cannot block cleanup.
+            try:
+                latency = time.monotonic() - claude_call_started
+                await bot_metrics.claude_calls_total.inc(outcome=claude_outcome)
+                await bot_metrics.claude_latency_seconds.observe(latency)
+            except Exception as metrics_err:
+                logger.debug(
+                    "Failed to record Claude metrics",
+                    error=str(metrics_err),
+                )
             heartbeat.cancel()
             self._active_requests.pop(user_id, None)
             if draft_streamer:
