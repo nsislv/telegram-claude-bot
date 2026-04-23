@@ -12,13 +12,16 @@ import secrets
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
 
 from src.exceptions import SecurityError
 
 # from src.exceptions import AuthenticationError  # Future use
+
+if TYPE_CHECKING:
+    from src.storage.repositories import UserTokenRepository
 
 logger = structlog.get_logger()
 
@@ -137,6 +140,80 @@ class InMemoryTokenStorage(TokenStorage):
     async def revoke_token(self, user_id: int) -> None:
         """Remove token from memory."""
         self._tokens.pop(user_id, None)
+
+
+class SQLiteTokenStorage(TokenStorage):
+    """Durable token storage backed by the ``user_tokens`` SQLite table.
+
+    Replaces :class:`InMemoryTokenStorage` in production. The in-memory
+    version invalidated every issued token on restart — a DoS in disguise
+    (every user had to re-authenticate) and, combined with
+    :class:`InMemoryAuditStorage`, wiped out the forensic trail during
+    incident response.
+    """
+
+    def __init__(self, repository: "UserTokenRepository") -> None:
+        self.repository = repository
+
+    async def store_token(
+        self, user_id: int, token_hash: str, expires_at: datetime
+    ) -> None:
+        """Insert a new active token, deactivating any prior row.
+
+        Mirrors the semantics of :class:`InMemoryTokenStorage` where the
+        dict is keyed by ``user_id`` (one live token per user). Callers
+        that re-issue for the same user get a clean replacement instead
+        of two concurrent active rows.
+        """
+        # Import deferred to avoid a circular import with storage.repositories
+        from src.storage.models import UserTokenModel
+
+        await self.repository.upsert_active(
+            UserTokenModel(
+                user_id=user_id,
+                token_hash=token_hash,
+                created_at=datetime.now(UTC),
+                expires_at=expires_at,
+                last_used=None,
+                is_active=True,
+            )
+        )
+
+    async def get_user_token(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Return the user's active, non-expired token as a plain dict.
+
+        Shape matches the legacy in-memory version so :class:`TokenAuthProvider`
+        needs no changes:
+
+        - ``hash`` (str)
+        - ``expires_at`` (datetime)
+        - ``created_at`` (datetime)
+        """
+        token = await self.repository.get_active_for_user(user_id)
+        if token is None:
+            return None
+
+        # Touch last_used so audit traces can show when a token was
+        # presented to the bot. Best-effort — failures must not block auth.
+        try:
+            if token.token_id is not None:
+                await self.repository.touch_last_used(token.token_id)
+        except Exception:  # pragma: no cover — defensive
+            logger.debug(
+                "Failed to update last_used timestamp",
+                user_id=user_id,
+                token_id=token.token_id,
+            )
+
+        return {
+            "hash": token.token_hash,
+            "expires_at": token.expires_at,
+            "created_at": token.created_at,
+        }
+
+    async def revoke_token(self, user_id: int) -> None:
+        """Deactivate all tokens for the user (durable revocation)."""
+        await self.repository.revoke(user_id)
 
 
 class TokenAuthProvider(AuthProvider):

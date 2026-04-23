@@ -26,6 +26,7 @@ from .repositories import (
     SessionRepository,
     ToolUsageRepository,
     UserRepository,
+    UserTokenRepository,
 )
 
 logger = structlog.get_logger()
@@ -44,6 +45,7 @@ class Storage:
         self.tools = ToolUsageRepository(self.db_manager)
         self.audit = AuditLogRepository(self.db_manager)
         self.costs = CostTrackingRepository(self.db_manager)
+        self.tokens = UserTokenRepository(self.db_manager)
         self.analytics = AnalyticsRepository(self.db_manager)
 
     async def initialize(self):

@@ -10,11 +10,15 @@ Features:
 import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
 
 # from src.exceptions import SecurityError  # Future use
+
+if TYPE_CHECKING:
+    from src.storage.models import AuditLogModel
+    from src.storage.repositories import AuditLogRepository
 
 logger = structlog.get_logger()
 
@@ -125,6 +129,102 @@ class InMemoryAuditStorage(AuditStorage):
         self, user_id: Optional[int] = None, limit: int = 100
     ) -> List[AuditEvent]:
         """Get security violations."""
+        return await self.get_events(
+            user_id=user_id, event_type="security_violation", limit=limit
+        )
+
+
+class SQLiteAuditStorage(AuditStorage):
+    """Durable SQLite-backed audit storage.
+
+    Forensic evidence must survive a process restart — especially because
+    the threat model for this bot includes a compromised user coercing
+    Claude into killing the process (thereby erasing any in-memory log).
+    This implementation writes every event to the ``audit_log`` table via
+    the existing :class:`AuditLogRepository`, and lifts the
+    ``details`` / ``session_id`` / ``risk_level`` fields from
+    :class:`AuditEvent` into the ``event_data`` JSON column.
+    """
+
+    def __init__(self, repository: "AuditLogRepository") -> None:
+        self.repository = repository
+
+    def _event_to_model(self, event: AuditEvent) -> "AuditLogModel":
+        """Translate ``AuditEvent`` into the storage-layer ``AuditLogModel``.
+
+        ``AuditLogModel`` does not have a native place for session_id or
+        risk_level, so both are folded into ``event_data`` alongside the
+        caller-supplied ``details`` dict. Keys are namespaced with an
+        underscore so they don't collide with caller keys.
+        """
+        # Import here to avoid a circular import at module load time.
+        from src.storage.models import AuditLogModel
+
+        event_data: Dict[str, Any] = dict(event.details or {})
+        event_data["_session_id"] = event.session_id
+        event_data["_risk_level"] = event.risk_level
+
+        return AuditLogModel(
+            user_id=event.user_id,
+            event_type=event.event_type,
+            timestamp=event.timestamp,
+            event_data=event_data,
+            success=event.success,
+            ip_address=event.ip_address,
+        )
+
+    def _model_to_event(self, model: "AuditLogModel") -> AuditEvent:
+        """Reverse of :meth:`_event_to_model` for read paths."""
+        event_data = dict(model.event_data or {})
+        session_id = event_data.pop("_session_id", None)
+        risk_level = event_data.pop("_risk_level", "low") or "low"
+
+        return AuditEvent(
+            timestamp=model.timestamp,
+            user_id=model.user_id,
+            event_type=model.event_type,
+            success=bool(model.success),
+            details=event_data,
+            ip_address=model.ip_address,
+            session_id=session_id,
+            risk_level=risk_level,
+        )
+
+    async def store_event(self, event: AuditEvent) -> None:
+        """Persist the event and warn on high-risk writes."""
+        await self.repository.log_event(self._event_to_model(event))
+
+        if event.risk_level in ("high", "critical"):
+            logger.warning(
+                "High-risk security event",
+                event_type=event.event_type,
+                user_id=event.user_id,
+                risk_level=event.risk_level,
+                details=event.details,
+            )
+
+    async def get_events(
+        self,
+        user_id: Optional[int] = None,
+        event_type: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: int = 100,
+    ) -> List[AuditEvent]:
+        """Query events with all filters applied in SQL."""
+        models = await self.repository.query(
+            user_id=user_id,
+            event_type=event_type,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+        return [self._model_to_event(m) for m in models]
+
+    async def get_security_violations(
+        self, user_id: Optional[int] = None, limit: int = 100
+    ) -> List[AuditEvent]:
+        """Return recent security-violation events (newest first)."""
         return await self.get_events(
             user_id=user_id, event_type="security_violation", limit=limit
         )

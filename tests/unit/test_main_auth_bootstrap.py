@@ -39,7 +39,9 @@ def test_returns_whitelist_provider_when_users_configured():
 def test_adds_token_provider_when_enabled():
     """Token auth stacks on top of whitelist when both configured."""
     providers = build_auth_providers(
-        _config(allowed_users=[111], enable_token_auth=True), MagicMock()
+        _config(allowed_users=[111], enable_token_auth=True),
+        MagicMock(),
+        token_storage=MagicMock(),
     )
 
     assert len(providers) == 2
@@ -58,10 +60,24 @@ def test_token_only_config_does_not_trigger_dev_fallback():
             allow_all_dev_users=False,
         ),
         MagicMock(),
+        token_storage=MagicMock(),
     )
 
     assert len(providers) == 1
     assert isinstance(providers[0], TokenAuthProvider)
+
+
+def test_token_auth_without_storage_refuses_to_start():
+    """C3 — token auth without a durable storage must NOT silently fall
+    back to an in-memory store. A misconfiguration here would invalidate
+    every issued token on restart and lose forensic traces."""
+    with pytest.raises(ConfigurationError) as exc:
+        build_auth_providers(
+            _config(allowed_users=[111], enable_token_auth=True),
+            MagicMock(),
+            # token_storage intentionally omitted
+        )
+    assert "token storage" in str(exc.value).lower()
 
 
 class TestClosedByDefaultRefusesToStart:

@@ -26,10 +26,10 @@ from src.exceptions import ConfigurationError
 from src.notifications.service import NotificationService
 from src.projects import ProjectThreadManager, load_project_registry
 from src.scheduler.scheduler import JobScheduler
-from src.security.audit import AuditLogger, InMemoryAuditStorage
+from src.security.audit import AuditLogger, SQLiteAuditStorage
 from src.security.auth import (
     AuthenticationManager,
-    InMemoryTokenStorage,
+    SQLiteTokenStorage,
     TokenAuthProvider,
     WhitelistAuthProvider,
 )
@@ -92,12 +92,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_auth_providers(config: Settings, logger: Any) -> list:
+def build_auth_providers(
+    config: Settings,
+    logger: Any,
+    token_storage: Optional[Any] = None,
+) -> list:
     """Build the ordered list of authentication providers from configuration.
 
     Factored out of ``create_application`` so the auth-bootstrap rules can
     be exercised by tests in isolation — this is the most safety-critical
     piece of bot startup.
+
+    ``token_storage`` is injected (rather than built here) so production
+    wires a :class:`SQLiteTokenStorage` while tests can pass an in-memory
+    double. When ``None`` and ``enable_token_auth`` is true, a
+    :class:`ConfigurationError` is raised — we refuse to silently fall back
+    to non-durable storage in production.
 
     Rules:
 
@@ -129,7 +139,11 @@ def build_auth_providers(config: Settings, logger: Any) -> list:
 
     # Add token provider if enabled
     if config.enable_token_auth:
-        token_storage = InMemoryTokenStorage()  # TODO: Use database storage
+        if token_storage is None:
+            raise ConfigurationError(
+                "ENABLE_TOKEN_AUTH=true but no token storage was wired in "
+                "(fix: pass a SQLiteTokenStorage to build_auth_providers)."
+            )
         providers.append(TokenAuthProvider(config.auth_token_secret, token_storage))
 
     if providers:
@@ -183,8 +197,12 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     storage = Storage(config.database_url)
     await storage.initialize()
 
-    # Create security components
-    providers = build_auth_providers(config, logger)
+    # Create security components. Tokens and audit events are persisted
+    # to SQLite so they survive a restart — critical for forensic evidence
+    # after a security incident and to avoid invalidating every issued
+    # token whenever the process bounces.
+    token_storage = SQLiteTokenStorage(storage.tokens)
+    providers = build_auth_providers(config, logger, token_storage=token_storage)
 
     auth_manager = AuthenticationManager(providers)
     security_validator = SecurityValidator(
@@ -193,8 +211,8 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     )
     rate_limiter = RateLimiter(config)
 
-    # Create audit storage and logger
-    audit_storage = InMemoryAuditStorage()  # TODO: Use database storage in production
+    # Create audit storage and logger (SQLite-backed, durable).
+    audit_storage = SQLiteAuditStorage(storage.audit)
     audit_logger = AuditLogger(audit_storage)
 
     # Create Claude integration components with persistent storage

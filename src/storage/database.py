@@ -310,6 +310,41 @@ class DatabaseManager:
                     ON project_threads(project_slug);
                 """,
             ),
+            (
+                5,
+                # Drop the FOREIGN KEY on audit_log.user_id. Audit records
+                # must be writable for any user_id — including first-contact
+                # authentication attempts where the users row has not yet
+                # been created, and including malicious or rejected IDs we
+                # want to preserve for forensics. SQLite cannot drop a
+                # constraint in place, so recreate the table and copy rows.
+                """
+                CREATE TABLE audit_log_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_data JSON,
+                    success BOOLEAN DEFAULT TRUE,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    ip_address TEXT
+                );
+
+                INSERT INTO audit_log_new
+                    (id, user_id, event_type, event_data, success,
+                     timestamp, ip_address)
+                SELECT id, user_id, event_type, event_data, success,
+                       timestamp, ip_address
+                FROM audit_log;
+
+                DROP TABLE audit_log;
+                ALTER TABLE audit_log_new RENAME TO audit_log;
+
+                CREATE INDEX IF NOT EXISTS idx_audit_log_user_id
+                    ON audit_log(user_id);
+                CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
+                    ON audit_log(timestamp);
+                """,
+            ),
         ]
 
     async def _init_pool(self):
