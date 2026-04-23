@@ -30,11 +30,20 @@ sqlite3.register_converter("DATETIME", lambda b: datetime.fromisoformat(b.decode
 sqlite3.register_converter("DATE", lambda b: b.decode())
 
 # Initial schema migration
+# R3 — every DDL uses ``IF NOT EXISTS``.
+#
+# The pre-fix migration 1 used bare ``CREATE TABLE`` / ``CREATE
+# INDEX``. That meant any re-run of migration 1 (accidental schema
+# reset during tests, manual rollback + replay, or a future
+# tooling step) would raise ``OperationalError: table 'users'
+# already exists`` and break startup. With IF NOT EXISTS the DDL
+# is self-healing — the migration runner still gates replays by
+# ``schema_version``, this is belt and braces.
 INITIAL_SCHEMA = """
 -- Core Tables
 
 -- Users table
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     telegram_username TEXT,
     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -46,7 +55,7 @@ CREATE TABLE users (
 );
 
 -- Sessions table
-CREATE TABLE sessions (
+CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,
     project_path TEXT NOT NULL,
@@ -60,7 +69,7 @@ CREATE TABLE sessions (
 );
 
 -- Messages table
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
     message_id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
     user_id INTEGER NOT NULL,
@@ -75,7 +84,7 @@ CREATE TABLE messages (
 );
 
 -- Tool usage table
-CREATE TABLE tool_usage (
+CREATE TABLE IF NOT EXISTS tool_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
     message_id INTEGER,
@@ -89,7 +98,7 @@ CREATE TABLE tool_usage (
 );
 
 -- Audit log table
-CREATE TABLE audit_log (
+CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     event_type TEXT NOT NULL,
@@ -101,7 +110,7 @@ CREATE TABLE audit_log (
 );
 
 -- User tokens table (for token auth)
-CREATE TABLE user_tokens (
+CREATE TABLE IF NOT EXISTS user_tokens (
     token_id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     token_hash TEXT NOT NULL UNIQUE,
@@ -113,7 +122,7 @@ CREATE TABLE user_tokens (
 );
 
 -- Cost tracking table
-CREATE TABLE cost_tracking (
+CREATE TABLE IF NOT EXISTS cost_tracking (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     date DATE NOT NULL,
@@ -124,13 +133,14 @@ CREATE TABLE cost_tracking (
 );
 
 -- Indexes for performance
-CREATE INDEX idx_sessions_user_id ON sessions(user_id);
-CREATE INDEX idx_sessions_project_path ON sessions(project_path);
-CREATE INDEX idx_messages_session_id ON messages(session_id);
-CREATE INDEX idx_messages_timestamp ON messages(timestamp);
-CREATE INDEX idx_audit_log_user_id ON audit_log(user_id);
-CREATE INDEX idx_audit_log_timestamp ON audit_log(timestamp);
-CREATE INDEX idx_cost_tracking_user_date ON cost_tracking(user_id, date);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_project_path ON sessions(project_path);
+CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_cost_tracking_user_date
+    ON cost_tracking(user_id, date);
 """
 
 
