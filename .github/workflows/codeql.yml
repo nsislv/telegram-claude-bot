@@ -1,0 +1,58 @@
+name: CodeQL
+
+# Static application security testing via GitHub CodeQL. Runs on:
+#
+# - every push to main (results feed the Security tab),
+# - every PR targeting main (blocks merges if new vulns are
+#   introduced, once branch protection is configured), and
+# - a weekly cron so the rule set picks up newly-published queries
+#   even when the codebase hasn't changed.
+#
+# Python-only today; add entries to the ``language`` matrix if the
+# repo ever gains JS/TS or other supported languages.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Every Monday at 07:00 UTC. Off-peak enough that scans aren't
+    # competing with Dependabot PRs (which also run Mondays).
+    - cron: "0 7 * * 1"
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # ``security-and-quality`` pulls in every default query plus
+          # maintainability flags. The security-only suite would miss
+          # e.g. hardcoded secrets patterns we care about.
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

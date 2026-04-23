@@ -1,0 +1,48 @@
+version: 2
+
+# Dependabot configuration for this repository.
+#
+# Two ecosystems watched:
+#
+# 1. ``pip`` — Dependabot understands Poetry's ``pyproject.toml`` +
+#    ``poetry.lock`` out of the box when declared as ``package-ecosystem:
+#    pip`` on the repo root. It opens a PR for every out-of-date
+#    dependency.
+# 2. ``github-actions`` — pinned action versions in
+#    ``.github/workflows/*`` get bumped too, so we stay off deprecated
+#    runners and closed-for-security action versions (e.g. the tj-actions
+#    compromise).
+#
+# Both run weekly to avoid weekday-morning PR storms. The update PRs
+# go through the normal CI gauntlet (lint + mypy + tests + pip-audit),
+# so a bad upgrade is caught before merge.
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: "chore(deps)"
+      include: scope
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "chore(ci)"
+      include: scope
