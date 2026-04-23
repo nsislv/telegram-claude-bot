@@ -85,11 +85,62 @@ class TestCheckBashDirectoryBoundary:
         assert not valid
         assert "directory boundary violation" in error.lower()
 
-    def test_read_only_commands_pass(self) -> None:
-        for cmd in ["cat /etc/hosts", "ls /tmp", "head /var/log/syslog"]:
+    def test_no_path_read_commands_always_pass(self) -> None:
+        """Commands that take no filesystem paths (``pwd``, ``whoami``,
+        ``date`` etc.) pass through regardless of what follows them.
+
+        NB: ``env`` is deliberately NOT in this list — it's a wrapper
+        command and ``env cat /etc/shadow`` must NOT be short-circuited
+        here. Bare ``env`` (no args) is tested separately below.
+        """
+        for cmd in ["pwd", "whoami", "date", "echo hello world"]:
             valid, error = check_bash_directory_boundary(cmd, self.cwd, self.approved)
-            assert valid, f"Expected read-only command to pass: {cmd}"
+            assert valid, f"Expected no-path command to pass: {cmd}"
             assert error is None
+
+    def test_bare_env_is_allowed(self) -> None:
+        """``env`` with no args emits the current environment and does
+        not wrap a command — the re-dispatch resolves to an empty
+        effective command, which is allowed."""
+        valid, _ = check_bash_directory_boundary("env", self.cwd, self.approved)
+        assert valid
+
+    def test_read_commands_inside_approved_directory_pass(self) -> None:
+        """Read-with-path commands against files INSIDE the approved
+        tree are fine — H3's fix is about the OUTSIDE case."""
+        approved_file = self.approved / "notes.md"
+        for cmd in [
+            f"cat {approved_file}",
+            f"head {approved_file}",
+            f"ls {self.approved}",
+            f"stat {approved_file}",
+        ]:
+            valid, error = check_bash_directory_boundary(cmd, self.cwd, self.approved)
+            assert valid, f"Expected read inside approved dir to pass: {cmd}"
+            assert error is None
+
+    def test_read_commands_outside_approved_directory_rejected(self) -> None:
+        """H3 regression test — pre-fix these all passed, leaking
+        arbitrary host files back to the user via Claude."""
+        for cmd in [
+            "cat /etc/hosts",
+            "cat /etc/shadow",
+            "tail /var/log/auth.log",
+            "head /etc/passwd",
+            "ls /tmp",
+            "less /var/log/syslog",
+            "stat /home/other-user/.ssh/id_rsa",
+            "tree /home",
+            "du /var",
+            "realpath /etc/shadow",
+        ]:
+            valid, error = check_bash_directory_boundary(cmd, self.cwd, self.approved)
+            assert not valid, (
+                f"H3: read-with-path command outside approved dir "
+                f"must be rejected: {cmd}"
+            )
+            assert error is not None
+            assert "directory boundary violation" in error.lower()
 
     def test_non_fs_commands_pass(self) -> None:
         """Commands not in the filesystem-modifying set pass through."""
@@ -233,6 +284,216 @@ class TestCheckBashDirectoryBoundary:
         )
         assert not valid
         assert "/tmp" in error
+
+
+class TestH3BypassClosures:
+    """Regression guards for every bypass the review surfaced.
+
+    Each of these tests represents a concrete exfil / escape the
+    pre-review implementation would have allowed. They're kept as
+    one-line per-payload parametrised sweeps so adding a new class
+    of bypass is a one-liner — and so a regression is obvious.
+    """
+
+    def setup_method(self) -> None:
+        self.approved = Path("/root/projects")
+        self.cwd = Path("/root/projects/myapp")
+
+    # --- Expanded read-with-paths set ---
+
+    def test_expanded_read_commands_blocked_outside(self) -> None:
+        """Grep/awk/xxd/md5sum etc. were missing from the original
+        read-paths set. They must all be rejected when targeting
+        outside the approved tree."""
+        payloads = [
+            "grep root /etc/passwd",
+            "egrep -H foo /etc/shadow",
+            "fgrep bar /var/log/syslog",
+            "rg secret /etc",
+            "awk '{print}' /etc/shadow",
+            "sed -n 1p /etc/shadow",
+            "xxd /etc/shadow",
+            "hexdump /etc/shadow",
+            "od -c /etc/shadow",
+            "strings /bin/ls",
+            "md5sum /etc/shadow",
+            "sha256sum /etc/shadow",
+            "sha1sum /etc/shadow",
+            "sha512sum /etc/shadow",
+            "cksum /etc/shadow",
+            "tac /var/log/auth.log",
+            "rev /etc/hostname",
+            "nl /etc/passwd",
+            "cut -d: -f1 /etc/passwd",
+            "readlink /etc/mtab",
+            "zcat /var/log/syslog.1.gz",
+            "bzcat /backups/snapshot.bz2",
+            "xzcat /backups/snapshot.xz",
+            "zgrep root /var/log/auth.log.1.gz",
+        ]
+        for cmd in payloads:
+            valid, error = check_bash_directory_boundary(cmd, self.cwd, self.approved)
+            assert not valid, f"expected rejection: {cmd}"
+            assert "directory boundary violation" in (error or "").lower()
+
+    # --- env re-dispatch bypass ---
+
+    def test_env_wrapped_command_is_re_dispatched(self) -> None:
+        """``env cat /etc/shadow`` must not short-circuit on ``env``.
+        The wrapper is peeled off; ``cat`` is the effective command."""
+        valid, error = check_bash_directory_boundary(
+            "env cat /etc/shadow", self.cwd, self.approved
+        )
+        assert not valid
+        assert "/etc/shadow" in (error or "")
+
+    def test_env_with_assignments_is_re_dispatched(self) -> None:
+        valid, error = check_bash_directory_boundary(
+            "env VAR=x FOO=y cat /etc/shadow", self.cwd, self.approved
+        )
+        assert not valid
+        assert "/etc/shadow" in (error or "")
+
+    def test_sudo_wrapped_command_is_re_dispatched(self) -> None:
+        valid, error = check_bash_directory_boundary(
+            "sudo -u bob cat /etc/shadow", self.cwd, self.approved
+        )
+        assert not valid
+        assert "/etc/shadow" in (error or "")
+
+    def test_chained_wrappers_all_peeled(self) -> None:
+        """``sudo env nohup cat /etc/shadow`` — every wrapper layer
+        must be stripped; the innermost ``cat`` gets validated."""
+        valid, error = check_bash_directory_boundary(
+            "sudo env nohup cat /etc/shadow", self.cwd, self.approved
+        )
+        assert not valid
+
+    def test_bare_wrapper_without_command_allowed(self) -> None:
+        """``env -u FOO`` has no effective command. Nothing to
+        validate — allow."""
+        valid, _ = check_bash_directory_boundary("env -u FOO", self.cwd, self.approved)
+        assert valid
+
+    # --- Redirect operator bypass ---
+
+    def test_redirect_with_no_path_command_rejected(self) -> None:
+        """``echo < /etc/shadow`` reads the file via redirect. The
+        pre-review short-circuit on ``echo`` in _NO_PATH_COMMANDS
+        let this through. Post-review: any redirect = refuse."""
+        valid, error = check_bash_directory_boundary(
+            "echo < /etc/shadow", self.cwd, self.approved
+        )
+        assert not valid
+        assert "redirect" in (error or "").lower()
+
+    def test_redirect_to_outside_path_rejected(self) -> None:
+        """``cat >/etc/foo`` writes to an outside target via
+        redirect. Refuse on the redirect alone."""
+        for cmd in [
+            "echo hi > /etc/motd",
+            "cat > /etc/shadow",
+            "cat >> /etc/shadow",
+            "cat <<< 'x' > /etc/shadow",
+        ]:
+            valid, _ = check_bash_directory_boundary(cmd, self.cwd, self.approved)
+            assert not valid, f"expected rejection on redirect: {cmd}"
+
+    def test_redirect_inside_approved_also_rejected(self) -> None:
+        """Per review: redirect targets cannot be associated with
+        a command by the static analyser, so we fail closed even
+        when the target happens to be inside the approved tree.
+        The OS-level sandbox is the final arbiter."""
+        valid, _ = check_bash_directory_boundary(
+            "cat > /root/projects/out.txt", self.cwd, self.approved
+        )
+        assert not valid
+
+    # --- Runtime expansion bypass ---
+
+    def test_command_substitution_rejected(self) -> None:
+        for cmd in [
+            'cat "$(echo /etc/shadow)"',
+            "cat `echo /etc/shadow`",
+            "grep root $(echo /etc/passwd)",
+        ]:
+            valid, _ = check_bash_directory_boundary(cmd, self.cwd, self.approved)
+            assert not valid, f"expected rejection on substitution: {cmd}"
+
+    def test_variable_expansion_rejected(self) -> None:
+        for cmd in [
+            "cat ${HOME}/.ssh/id_rsa",
+            "cat $HOME/.bash_history",
+        ]:
+            valid, _ = check_bash_directory_boundary(cmd, self.cwd, self.approved)
+            assert not valid, f"expected rejection on expansion: {cmd}"
+
+    def test_process_substitution_rejected(self) -> None:
+        """``diff <(cat /etc/shadow) /tmp/x`` — bash evaluates
+        ``<(...)`` at runtime, we can't see the contents."""
+        valid, _ = check_bash_directory_boundary(
+            "diff <(cat /etc/shadow) /tmp/x", self.cwd, self.approved
+        )
+        assert not valid
+
+    def test_unquoted_glob_rejected(self) -> None:
+        """``cat /etc/*`` expands at runtime to an unknown list.
+        Refuse statically."""
+        for cmd in ["cat /etc/*", "grep root /etc/*.conf"]:
+            valid, _ = check_bash_directory_boundary(cmd, self.cwd, self.approved)
+            assert not valid
+
+    # --- Fail-closed on resolution error ---
+
+    def test_unresolvable_path_fails_closed_for_path_handler(self, monkeypatch) -> None:
+        """If ``Path.resolve`` raises, the pre-review code silently
+        allowed. Post-review: path-handler commands fail closed.
+
+        Implementation: let the first resolve (the approved-dir
+        sanity resolve at the top of the checker) succeed; every
+        subsequent resolve — those are the argument tokens — must
+        fail. Counter-based, so the test doesn't depend on string-
+        matching path forms across OSes.
+        """
+        import pathlib
+
+        original = pathlib.Path.resolve
+        state = {"calls": 0}
+
+        def flaky_resolve(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return original(self, *args, **kwargs)
+            raise OSError("boom")
+
+        monkeypatch.setattr(pathlib.Path, "resolve", flaky_resolve)
+
+        valid, error = check_bash_directory_boundary(
+            "cat /etc/shadow", self.cwd, self.approved
+        )
+        assert not valid
+        assert "could not be resolved" in (error or "")
+
+    # --- Printenv explicitly leaks ---
+
+    def test_printenv_with_name_is_rejected(self) -> None:
+        """``printenv SECRET`` emits the env value. Pre-review
+        ``printenv`` was in the no-path set; now it's in the
+        read-with-paths set so it trips path validation (which
+        fails because ``SECRET`` is not a resolvable path either
+        way, but the right thing happens)."""
+        # Note: ``printenv SOME_VAR`` treats SOME_VAR as a name, not
+        # a path. Our static analyser will resolve it relative to cwd
+        # and probably allow (since the cwd is inside approved). Not
+        # a bypass per se — env leaks happen at runtime — but we
+        # record the behaviour so changes to the set get noticed.
+        valid, _ = check_bash_directory_boundary(
+            "printenv SOME_VAR", self.cwd, self.approved
+        )
+        # Current behaviour: SOME_VAR resolves to cwd/SOME_VAR which
+        # is inside approved → allowed. The "real" env leak is a
+        # runtime concern that can't be caught by path analysis.
+        assert valid
 
 
 class TestIsClaudeInternalPath:

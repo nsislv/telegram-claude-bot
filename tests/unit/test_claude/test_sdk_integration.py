@@ -913,10 +913,22 @@ class TestCanUseToolCallback:
         result = await callback("Grep", {"pattern": "foo"}, context)
         assert isinstance(result, PermissionResultAllow)
 
-    async def test_allows_bash_read_only_command(self, callback, context):
-        """Read-only bash commands pass through even with external paths."""
+    async def test_denies_read_only_bash_with_external_path(self, callback, context):
+        """H3 regression guard — pre-fix, ``cat /etc/hosts`` (a
+        read-only bash command) passed the boundary check with no
+        path validation. That was a data-exfil path. The boundary
+        checker now validates paths for read-with-path commands too."""
+        from claude_agent_sdk import PermissionResultDeny
+
         result = await callback("Bash", {"command": "cat /etc/hosts"}, context)
-        assert isinstance(result, PermissionResultAllow)
+        assert isinstance(result, PermissionResultDeny)
+
+    async def test_allows_no_path_bash_command(self, callback, context):
+        """``pwd`` / ``whoami`` / ``date`` and friends take no file
+        arguments and must still pass through."""
+        for cmd in ["pwd", "whoami", "date", "echo hi"]:
+            result = await callback("Bash", {"command": cmd}, context)
+            assert isinstance(result, PermissionResultAllow), f"{cmd} should be allowed"
 
     async def test_file_tool_without_path_allowed(self, callback, context):
         """File tool call without a path key is allowed (no path to validate)."""
