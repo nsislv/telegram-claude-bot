@@ -8,6 +8,7 @@ Features:
 """
 
 import hashlib
+import hmac
 import secrets
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -24,6 +25,27 @@ if TYPE_CHECKING:
     from src.storage.repositories import UserTokenRepository
 
 logger = structlog.get_logger()
+
+
+def _coerce_secret_bytes(secret: Any) -> bytes:
+    """Extract a ``bytes`` key material from a ``str`` or Pydantic ``SecretStr``.
+
+    ``TokenAuthProvider.secret`` can be either a plain string (tests,
+    direct construction) or a Pydantic ``SecretStr`` (the production
+    path — ``settings.auth_token_secret``). The former stringifies to
+    its value, the latter to ``"**********"``. Pulling the real value
+    lives here so every hash/HMAC path takes the same shape.
+    """
+    if secret is None:
+        # Defence in depth — C3 / build_auth_providers already refuses
+        # to start without a real secret when token auth is enabled,
+        # but a direct caller could still hit this path.
+        raise SecurityError("TokenAuthProvider requires a non-empty secret")
+    if hasattr(secret, "get_secret_value"):
+        return secret.get_secret_value().encode()
+    if isinstance(secret, bytes):
+        return secret
+    return str(secret).encode()
 
 
 @dataclass
@@ -287,12 +309,32 @@ class TokenAuthProvider(AuthProvider):
         return None
 
     def _hash_token(self, token: str) -> str:
-        """Hash token for secure storage."""
-        return hashlib.sha256(f"{token}{self.secret}".encode()).hexdigest()
+        """Hash a token using HMAC-SHA256 with the provider secret as key.
+
+        M3 fix — prior implementation concatenated the secret onto the
+        token and passed that into a bare SHA-256 hash. Concat-then-
+        hash is the textbook setup for length-extension attacks and
+        has no reason to exist when HMAC is in the standard library.
+        HMAC also keyed the hash with the secret rather than smuggling
+        it into the message, which is how token stores are supposed to
+        be built.
+        """
+        return hmac.new(
+            _coerce_secret_bytes(self.secret),
+            token.encode(),
+            hashlib.sha256,
+        ).hexdigest()
 
     def _verify_token(self, token: str, stored_hash: str) -> bool:
-        """Verify token against stored hash."""
-        return self._hash_token(token) == stored_hash
+        """Constant-time compare of the computed hash against storage.
+
+        M2 fix — plain ``==`` on hex digests leaks a timing signal on
+        the index of the first mismatched byte. Practically
+        unexploitable against Telegram's round-trip latency, but a
+        bad pattern to ship when ``hmac.compare_digest`` is right
+        there and already used correctly in ``src/api/auth.py``.
+        """
+        return hmac.compare_digest(self._hash_token(token), stored_hash)
 
 
 class AuthenticationManager:
