@@ -32,11 +32,66 @@ StandardError=journal
 # Environment
 Environment="PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
+# --- Hardening ----------------------------------------------------
+# Every line below shrinks the blast radius if the bot process (or
+# Claude, via a tool call) is compromised. Adjust ReadWritePaths to
+# match your APPROVED_DIRECTORY.
+
+# Privilege / credentials
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+
+# Filesystem isolation
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/home/ubuntu/Code/oss/claude-code-telegram /home/ubuntu/projects
+PrivateTmp=yes
+PrivateDevices=yes
+
+# Kernel surface
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# Process hardening
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+
+# Network surface — IPv4/6 + local unix sockets only
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Capabilities — drop everything. The bot only needs outbound TCP.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Syscall filter — standard service profile, deny the dangerous classes.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @obsolete
+SystemCallErrorNumber=EPERM
+
+# Resource ceilings (tune for your host)
+LimitNOFILE=4096
+TasksMax=256
+# ------------------------------------------------------------------
+
 [Install]
 WantedBy=default.target
 ```
 
-**Note:** Update `WorkingDirectory` to your project path.
+**Note:** Update `WorkingDirectory` and `ReadWritePaths` to your
+project path and your `APPROVED_DIRECTORY`. If the bot cannot start
+after adding the hardening block, bisect by commenting out one
+directive at a time (`MemoryDenyWriteExecute=yes` and the
+`SystemCallFilter` lines are the two most common culprits when
+native extensions are in use).
 
 ### 2. Enable and start the service
 
