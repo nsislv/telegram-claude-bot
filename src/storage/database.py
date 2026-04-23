@@ -137,12 +137,48 @@ CREATE INDEX idx_cost_tracking_user_date ON cost_tracking(user_id, date);
 class DatabaseManager:
     """Manage database connections and initialization."""
 
+    # Pragmas applied to every connection opened by this manager.
+    #
+    # - ``journal_mode=WAL`` — readers no longer block writers and vice
+    #   versa; essential for a concurrent async app. Historically this
+    #   was set inside migration 3, but pragma statements inside a
+    #   transaction are silent no-ops, so WAL was never actually
+    #   enabled for most installs.
+    # - ``synchronous=NORMAL`` — WAL's "safe default"; durable across
+    #   app crashes, only weak against whole-OS crashes, with a
+    #   meaningful fsync cost reduction.
+    # - ``busy_timeout=5000`` — makes concurrent writers wait up to 5s
+    #   on the internal write lock instead of immediately raising
+    #   ``SQLITE_BUSY``. Without this, parallel cost-tracking updates
+    #   race and one of them raises.
+    # - ``foreign_keys=ON`` — SQLite default is OFF; we rely on FKs for
+    #   session/user integrity.
+    _CONNECTION_PRAGMAS = (
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA synchronous=NORMAL",
+        "PRAGMA busy_timeout=5000",
+        "PRAGMA foreign_keys=ON",
+    )
+
     def __init__(self, database_url: str):
         """Initialize database manager."""
         self.database_path = self._parse_database_url(database_url)
         self._connection_pool = []
         self._pool_size = 5
         self._pool_lock = asyncio.Lock()
+
+    async def _configure_connection(self, conn: aiosqlite.Connection) -> None:
+        """Apply the durability/concurrency pragmas to ``conn``.
+
+        WAL must be set **outside** a transaction, and ideally per
+        connection (WAL is persistent at the database level but other
+        pragmas like ``synchronous`` and ``busy_timeout`` are
+        connection-local). Centralising this here means the migration
+        runner, the pool initialiser, and the on-demand new-connection
+        path all get identical setup.
+        """
+        for pragma in self._CONNECTION_PRAGMAS:
+            await conn.execute(pragma)
 
     def _parse_database_url(self, database_url: str) -> Path:
         """Parse database URL to path."""
@@ -189,8 +225,10 @@ class DatabaseManager:
         ) as conn:
             conn.row_factory = aiosqlite.Row
 
-            # Enable foreign keys
-            await conn.execute("PRAGMA foreign_keys = ON")
+            # Apply all durability/concurrency pragmas before touching
+            # any data. WAL in particular must be set before the first
+            # write transaction on a fresh DB.
+            await self._configure_connection(conn)
 
             # Get current version
             current_version = await self._get_schema_version(conn)
@@ -411,7 +449,7 @@ class DatabaseManager:
                     self.database_path, detect_types=sqlite3.PARSE_DECLTYPES
                 )
                 conn.row_factory = aiosqlite.Row
-                await conn.execute("PRAGMA foreign_keys = ON")
+                await self._configure_connection(conn)
                 self._connection_pool.append(conn)
 
     @asynccontextmanager
@@ -425,7 +463,7 @@ class DatabaseManager:
                     self.database_path, detect_types=sqlite3.PARSE_DECLTYPES
                 )
                 conn.row_factory = aiosqlite.Row
-                await conn.execute("PRAGMA foreign_keys = ON")
+                await self._configure_connection(conn)
 
         try:
             yield conn
@@ -435,6 +473,32 @@ class DatabaseManager:
                     self._connection_pool.append(conn)
                 else:
                     await conn.close()
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Run a block of statements as a single atomic SQLite transaction.
+
+        Acquires one pooled connection, wraps the body in ``BEGIN
+        IMMEDIATE`` / ``COMMIT`` (or ``ROLLBACK`` on exception). The
+        ``IMMEDIATE`` mode takes the reserved write lock up-front, which
+        makes ``SQLITE_BUSY`` deterministic (early, with ``busy_timeout``
+        applied) instead of late-mid-transaction.
+
+        Callers that already use repositories should pass the yielded
+        ``conn`` to each repo method's ``conn=`` kwarg so every statement
+        joins this transaction rather than borrowing a separate pooled
+        connection (which would commit independently and defeat
+        atomicity).
+        """
+        async with self.get_connection() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except Exception:
+                await conn.rollback()
+                raise
+            else:
+                await conn.commit()
 
     async def close(self):
         """Close all connections in pool."""
