@@ -158,16 +158,16 @@ class TestJsonlAuditStorage:
         assert events == []
 
     async def test_permissions_tightened_on_posix(self, tmp_path: Path):
-        """On POSIX we chmod to 640 so a non-root user cannot read
-        the audit log. On Windows the chmod is a no-op and this
-        test just proves we don't crash."""
+        """On POSIX we chmod to 600 so only the owner can read the
+        audit log. On Windows the chmod is a no-op and this test
+        just proves we don't crash."""
         path = tmp_path / "audit.log"
         sink = JsonlAuditStorage(path)
         await sink.store_event(_event())
 
         if os.name == "posix":
             mode = path.stat().st_mode & 0o777
-            assert mode == 0o640
+            assert mode == 0o600
 
         await sink.close()
 
