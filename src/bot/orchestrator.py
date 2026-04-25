@@ -636,9 +636,9 @@ class MessageOrchestrator:
                         _dt = datetime.fromtimestamp(int(ts), tz=_tz.utc)
                         _secs = int((_dt - datetime.now(_tz.utc)).total_seconds())
                         if _secs <= 0:
-                            return "сейчас"
+                            return "now"
                         h, m = divmod(_secs // 60, 60)
-                        return f"через {h}ч {m}м" if h else f"через {m}м"
+                        return f"{h}h {m}m" if h else f"{m}m"
                     except Exception:
                         return ts
 
@@ -652,10 +652,8 @@ class MessageOrchestrator:
                 api_limits_str = (
                     f"\n🌐 <b>Anthropic</b>\n"
                     f"  Model: <code>{_actual_model}</code>\n"
-                    f"  Limit 5h:  [{_5h_bar}] {_5h_util*100:.0f}%"
-                    f"  · reset in {_5h_reset}\n"
-                    f"  Limit 7d:  [{_7d_bar}] {_7d_util*100:.0f}%"
-                    f"  · reset in {_7d_reset}"
+                    f"  Limit 5h:  [{_5h_bar}] {_5h_util*100:.0f}%  {_5h_reset}\n"
+                    f"  Limit 7d:  [{_7d_bar}] {_7d_util*100:.0f}%  {_7d_reset}"
                 )
             else:
                 api_limits_str = "\n🌐 <b>Anthropic</b>\n  <i>недоступно</i>"
