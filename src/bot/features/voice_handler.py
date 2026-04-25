@@ -87,7 +87,9 @@ class VoiceHandler:
             file_size=initial_file_size or resolved_file_size or len(voice_bytes),
         )
 
-        if self.config.voice_provider == "local":
+        if self.config.voice_provider == "faster-whisper":
+            transcription = await self._transcribe_faster_whisper(voice_bytes)
+        elif self.config.voice_provider == "local":
             transcription = await self._transcribe_local(voice_bytes)
         elif self.config.voice_provider == "openai":
             transcription = await self._transcribe_openai(voice_bytes)
@@ -112,6 +114,62 @@ class VoiceHandler:
             transcription=transcription,
             duration=duration_secs,
         )
+
+    # -- faster-whisper provider (local, no API key required) --
+
+    async def _transcribe_faster_whisper(self, voice_bytes: bytes) -> str:
+        """Transcribe audio locally using faster-whisper."""
+        try:
+            from faster_whisper import WhisperModel
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "faster-whisper is not installed. Run: pip install faster-whisper"
+            ) from exc
+
+        model_name = self.config.faster_whisper_model
+        language = self.config.faster_whisper_language or None
+
+        tmp_dir = None
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="voice_fw_")
+            ogg_path = Path(tmp_dir) / "voice.ogg"
+            ogg_path.write_bytes(voice_bytes)
+
+            loop = asyncio.get_event_loop()
+            text = await loop.run_in_executor(
+                None,
+                self._run_faster_whisper_sync,
+                str(ogg_path),
+                model_name,
+                language,
+            )
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        text = text.strip()
+        if not text:
+            raise ValueError(
+                "faster-whisper transcription returned an empty response."
+            )
+        return text
+
+    @staticmethod
+    def _run_faster_whisper_sync(
+        audio_path: str, model_name: str, language: Optional[str]
+    ) -> str:
+        """Run faster-whisper synchronously (called in executor)."""
+        from faster_whisper import WhisperModel
+
+        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        segments, _ = model.transcribe(
+            audio_path,
+            language=language,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+        )
+        return " ".join(seg.text.strip() for seg in segments)
 
     # -- Mistral provider --
 

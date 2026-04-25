@@ -135,3 +135,22 @@ Agentic mode commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`. If `ENA
 2. Register in `MessageOrchestrator._register_classic_handlers()`
 3. Add to `MessageOrchestrator.get_bot_commands()` for Telegram's command menu
 4. Add audit logging for the command
+
+## Integrations & Tools
+
+### Google Workspace (GWS)
+The server has `gws` CLI installed and authenticated for `tatarenecs@gmail.com`. 
+You can use it via Bash:
+- `gws gmail +triage` - view recent emails
+- `gws drive files list` - list files
+- `gws calendar +agenda` - show schedule
+- `gws sheets +append` - add data to spreadsheets
+Use `gws <service> --help` to explore all available Google Workspace commands.
+
+### Paytraq MCP
+The Paytraq MCP server is located at `/root/production/paytraq-mcp`. Use it to manage accounting, invoices, and clients in PayTraq.
+
+### IMPORTANT: Google Drive Access
+You have full access to Google Drive via the `gws` CLI. If you get an error, try listing files first to verify connection:
+`gws drive files list --params '{"pageSize": 1}'`
+The credentials are pre-configured in the environment.
