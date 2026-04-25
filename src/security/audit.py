@@ -10,6 +10,7 @@ Features:
 
 import asyncio
 import json
+import weakref
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -297,6 +298,11 @@ class JsonlAuditStorage(AuditStorage):
         # ``a+`` so we can both append and later read. Line-buffered so
         # each write reaches the OS even before fsync.
         self._fh = open(self.path, "a+", buffering=1, encoding="utf-8")
+        # Belt-and-braces cleanup: ``close()`` is the primary path, but
+        # if a caller forgets, the finalizer guarantees the FD still
+        # gets released when the storage is collected. Also makes the
+        # close lifecycle explicit to static analyzers.
+        weakref.finalize(self, self._fh.close)
         # Best-effort tighten perms. ``chmod`` is a no-op on Windows
         # filesystems that don't support Unix perms; we log and
         # continue rather than fail.

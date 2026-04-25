@@ -101,14 +101,20 @@ class TestTransactionContext:
         class Boom(RuntimeError):
             pass
 
-        with pytest.raises(Boom) as exc_info:
+        async def _doomed_insert():
             async with db_manager.transaction() as conn:
                 await conn.execute(
                     "INSERT INTO _tx_rollback (id, label) VALUES (?, ?)",
                     (1, "should-not-persist"),
                 )
                 raise Boom("nope")
-        assert exc_info.type is Boom
+
+        caught = False
+        try:
+            await _doomed_insert()
+        except Boom:
+            caught = True
+        assert caught, "expected Boom to escape the transaction context"
 
         async with db_manager.get_connection() as conn:
             cursor = await conn.execute("SELECT COUNT(*) FROM _tx_rollback")

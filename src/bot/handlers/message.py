@@ -1,7 +1,6 @@
 """Message handlers for non-command inputs."""
 
 import asyncio
-import contextlib
 from typing import Optional
 
 import structlog
@@ -472,24 +471,22 @@ async def handle_text_message(
                                 )
                             caption_sent = True
                         else:
-                            with contextlib.ExitStack() as stack:
-                                media = []
-                                for idx, img in enumerate(photos[:10]):
-                                    fh = stack.enter_context(open(img.path, "rb"))
-                                    media.append(
-                                        InputMediaPhoto(
-                                            media=fh,
-                                            caption=msg.text if idx == 0 else None,
-                                            parse_mode=(
-                                                msg.parse_mode if idx == 0 else None
-                                            ),
-                                        )
+                            media = []
+                            for idx, img in enumerate(photos[:10]):
+                                media.append(
+                                    InputMediaPhoto(
+                                        media=img.path.read_bytes(),
+                                        caption=msg.text if idx == 0 else None,
+                                        parse_mode=(
+                                            msg.parse_mode if idx == 0 else None
+                                        ),
                                     )
-                                await update.message.chat.send_media_group(
-                                    media=media,
-                                    reply_to_message_id=update.message.message_id,
                                 )
-                                caption_sent = True
+                            await update.message.chat.send_media_group(
+                                media=media,
+                                reply_to_message_id=update.message.message_id,
+                            )
+                            caption_sent = True
                     except Exception as album_err:
                         logger.warning(
                             "Failed to send photo+caption", error=str(album_err)
@@ -550,15 +547,14 @@ async def handle_text_message(
                                     reply_to_message_id=update.message.message_id,
                                 )
                         else:
-                            with contextlib.ExitStack() as stack:
-                                media = []
-                                for img in photos[:10]:
-                                    fh = stack.enter_context(open(img.path, "rb"))
-                                    media.append(InputMediaPhoto(media=fh))
-                                await update.message.chat.send_media_group(
-                                    media=media,
-                                    reply_to_message_id=update.message.message_id,
-                                )
+                            media = [
+                                InputMediaPhoto(media=img.path.read_bytes())
+                                for img in photos[:10]
+                            ]
+                            await update.message.chat.send_media_group(
+                                media=media,
+                                reply_to_message_id=update.message.message_id,
+                            )
                     except Exception as album_err:
                         logger.warning(
                             "Failed to send photo album", error=str(album_err)

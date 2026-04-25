@@ -6,7 +6,6 @@ classic mode, delegates to existing full-featured handlers.
 """
 
 import asyncio
-import contextlib
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -961,28 +960,24 @@ class MessageOrchestrator:
                         )
                     caption_sent = use_caption
                 else:
-                    with contextlib.ExitStack() as stack:
-                        media = []
-                        for idx, img in enumerate(photos[:10]):
-                            fh = stack.enter_context(open(img.path, "rb"))
-                            media.append(
-                                InputMediaPhoto(
-                                    media=fh,
-                                    caption=(
-                                        caption if use_caption and idx == 0 else None
-                                    ),
-                                    parse_mode=(
-                                        caption_parse_mode
-                                        if use_caption and idx == 0
-                                        else None
-                                    ),
-                                )
+                    media = []
+                    for idx, img in enumerate(photos[:10]):
+                        media.append(
+                            InputMediaPhoto(
+                                media=img.path.read_bytes(),
+                                caption=(caption if use_caption and idx == 0 else None),
+                                parse_mode=(
+                                    caption_parse_mode
+                                    if use_caption and idx == 0
+                                    else None
+                                ),
                             )
-                        await update.message.chat.send_media_group(
-                            media=media,
-                            reply_to_message_id=reply_to_message_id,
                         )
-                        caption_sent = use_caption
+                    await update.message.chat.send_media_group(
+                        media=media,
+                        reply_to_message_id=reply_to_message_id,
+                    )
+                    caption_sent = use_caption
             except Exception as e:
                 logger.warning("Failed to send photo album", error=str(e))
 
