@@ -571,81 +571,41 @@ class MessageOrchestrator:
         cost_pct = (current_cost / max_cost_user * 100) if max_cost_user > 0 else 0
         cost_bar = "█" * int(cost_pct / 10) + "░" * (10 - int(cost_pct / 10))
 
-        # Anthropic API rate limits via raw response headers
-        api_limits_str = ""
-        try:
-            import json as _json
-            from datetime import datetime
-            from datetime import timezone as _tz
+        # Anthropic rate limits — read from cache saved after last Claude response
+        from datetime import datetime, timezone as _tz
 
-            import anthropic as _anthropic
+        def _fmt_reset(ts: str) -> str:
+            try:
+                _dt = datetime.fromtimestamp(int(ts), tz=_tz.utc)
+                _secs = int((_dt - datetime.now(_tz.utc)).total_seconds())
+                if _secs <= 0:
+                    return "now"
+                h, m = divmod(_secs // 60, 60)
+                return f"{h}h {m}m" if h else f"{m}m"
+            except Exception:
+                return ts
 
-            # Use OAuth token from Claude CLI credentials if no API key set
-            _api_key = (
-                self.settings.anthropic_api_key.get_secret_value()
-                if self.settings.anthropic_api_key
-                else None
+        _cached = context.bot_data.get("anthropic_rate_limits", {})
+        if _cached:
+            _5h_util = float(_cached.get("5h_util", 0))
+            _7d_util = float(_cached.get("7d_util", 0))
+            _5h_reset = _fmt_reset(_cached.get("5h_reset", "0"))
+            _7d_reset = _fmt_reset(_cached.get("7d_reset", "0"))
+            _cached_model = _cached.get("model", model_display)
+            _5h_bar = "█" * int(_5h_util * 10) + "░" * (10 - int(_5h_util * 10))
+            _7d_bar = "█" * int(_7d_util * 10) + "░" * (10 - int(_7d_util * 10))
+            api_limits_str = (
+                f"\n🌐 <b>Anthropic</b>\n"
+                f"  Model: <code>{_cached_model}</code>\n"
+                f"  Limit 5h:  [{_5h_bar}] {_5h_util*100:.0f}%  {_5h_reset}\n"
+                f"  Limit 7d:  [{_7d_bar}] {_7d_util*100:.0f}%  {_7d_reset}"
             )
-            if not _api_key:
-                try:
-                    with open("/root/.claude/.credentials.json") as _f:
-                        _creds = _json.load(_f)
-                    _api_key = _creds["claudeAiOauth"]["accessToken"]
-                except Exception:
-                    # Credentials file optional; fall through to "unavailable".
-                    logger.debug("Claude OAuth credentials not readable", exc_info=True)
-
-            if _api_key:
-                _client = _anthropic.Anthropic(api_key=_api_key)
-                _probe_model = last_model or "claude-haiku-4-5"
-                _resp = _client.messages.with_raw_response.create(
-                    model=_probe_model,
-                    max_tokens=1,
-                    messages=[{"role": "user", "content": "hi"}],
-                )
-                # Extract actual model from response
-                _actual_model = _resp.parse().model
-                if _actual_model and not last_model:
-                    context.user_data["last_claude_model"] = _actual_model
-
-                _h = _resp.headers
-
-                def _fmt_reset(ts: str) -> str:
-                    try:
-                        _dt = datetime.fromtimestamp(int(ts), tz=_tz.utc)
-                        _secs = int((_dt - datetime.now(_tz.utc)).total_seconds())
-                        if _secs <= 0:
-                            return "now"
-                        h, m = divmod(_secs // 60, 60)
-                        return f"{h}h {m}m" if h else f"{m}m"
-                    except Exception:
-                        return ts
-
-                _5h_util = float(
-                    _h.get("anthropic-ratelimit-unified-5h-utilization", 0)
-                )
-                _7d_util = float(
-                    _h.get("anthropic-ratelimit-unified-7d-utilization", 0)
-                )
-                _5h_reset = _fmt_reset(
-                    _h.get("anthropic-ratelimit-unified-5h-reset", "0")
-                )
-                _7d_reset = _fmt_reset(
-                    _h.get("anthropic-ratelimit-unified-7d-reset", "0")
-                )
-                _5h_bar = "█" * int(_5h_util * 10) + "░" * (10 - int(_5h_util * 10))
-                _7d_bar = "█" * int(_7d_util * 10) + "░" * (10 - int(_7d_util * 10))
-
-                api_limits_str = (
-                    f"\n🌐 <b>Anthropic</b>\n"
-                    f"  Model: <code>{_actual_model}</code>\n"
-                    f"  Limit 5h:  [{_5h_bar}] {_5h_util*100:.0f}%  {_5h_reset}\n"
-                    f"  Limit 7d:  [{_7d_bar}] {_7d_util*100:.0f}%  {_7d_reset}"
-                )
-            else:
-                api_limits_str = "\n🌐 <b>Anthropic</b>\n  <i>недоступно</i>"
-        except Exception as _e:
-            api_limits_str = f"\n🌐 <b>Anthropic</b>\n  <i>ошибка: {_e}</i>"
+        else:
+            api_limits_str = (
+                f"\n🌐 <b>Anthropic</b>\n"
+                f"  Model: <code>{model_display}</code>\n"
+                f"  <i>лимиты появятся после первого сообщения</i>"
+            )
 
         # Cost block — only relevant when using direct API key
         using_api_key = bool(self.settings.anthropic_api_key)
@@ -676,6 +636,89 @@ class MessageOrchestrator:
         if user_override is not None:
             return int(user_override)
         return self.settings.verbose_level
+
+    async def _refresh_anthropic_limits(
+        self, bot_data: Dict[str, Any], model: Optional[str] = None
+    ) -> None:
+        """Fetch Anthropic unified rate-limit headers and cache them in bot_data.
+
+        Throttled to at most once every 5 minutes. Uses the OAuth access token
+        from ~/.claude/.credentials.json (same auth the Claude CLI uses).
+        Makes a minimal 1-token API call just to read the response headers.
+        Errors are silently swallowed — rate-limits display is best-effort.
+        """
+        import json as _json
+        import time as _time
+
+        import httpx
+
+        _REFRESH_INTERVAL = 300  # 5 minutes
+
+        now = _time.monotonic()
+        last = bot_data.get("anthropic_limits_last_refresh", 0.0)
+        if now - last < _REFRESH_INTERVAL:
+            return
+
+        # Mark refresh time immediately to avoid parallel refreshes
+        bot_data["anthropic_limits_last_refresh"] = now
+
+        try:
+            # Read OAuth token from Claude CLI credentials file
+            creds_path = Path.home() / ".claude" / ".credentials.json"
+            if not creds_path.exists():
+                return
+            creds = _json.loads(creds_path.read_text())
+            token = (
+                creds.get("claudeAiOauth", {}).get("accessToken")
+                or creds.get("oauthToken")
+                or creds.get("access_token")
+            )
+            if not token:
+                return
+
+            req_headers = {
+                "anthropic-version": "2023-06-01",
+                "Authorization": f"Bearer {token}",
+                "content-type": "application/json",
+            }
+            payload = {
+                "model": model or "claude-sonnet-4-5",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    json=payload,
+                    headers=req_headers,
+                )
+                h = resp.headers
+                cache: Dict[str, Any] = {}
+                if "anthropic-ratelimit-unified-5h-utilization" in h:
+                    cache["5h_util"] = float(
+                        h["anthropic-ratelimit-unified-5h-utilization"]
+                    )
+                if "anthropic-ratelimit-unified-7d-utilization" in h:
+                    cache["7d_util"] = float(
+                        h["anthropic-ratelimit-unified-7d-utilization"]
+                    )
+                if "anthropic-ratelimit-unified-5h-reset" in h:
+                    cache["5h_reset"] = h["anthropic-ratelimit-unified-5h-reset"]
+                if "anthropic-ratelimit-unified-7d-reset" in h:
+                    cache["7d_reset"] = h["anthropic-ratelimit-unified-7d-reset"]
+                if model:
+                    cache["model"] = model
+                # Only update cache if we got at least one header
+                if cache:
+                    bot_data["anthropic_rate_limits"] = cache
+                    logger.debug(
+                        "Anthropic rate limits cached", headers=list(cache.keys())
+                    )
+        except Exception as e:
+            logger.debug("Failed to refresh Anthropic rate limits", error=str(e))
+            # Reset last refresh so next call tries again sooner
+            bot_data["anthropic_limits_last_refresh"] = 0.0
 
     async def agentic_verbose(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1131,6 +1174,14 @@ class MessageOrchestrator:
             context.user_data["claude_session_id"] = claude_response.session_id
             if claude_response.model:
                 context.user_data["last_claude_model"] = claude_response.model
+
+            # Refresh Anthropic rate-limit cache (throttled, fire-and-forget)
+            asyncio.create_task(
+                self._refresh_anthropic_limits(
+                    context.bot_data,
+                    model=claude_response.model,
+                )
+            )
 
             # Track directory changes
             from .handlers.message import _update_working_directory_from_claude_response
