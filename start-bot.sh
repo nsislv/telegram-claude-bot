@@ -67,15 +67,63 @@ if [[ -f "${LOG_FILE}" ]]; then
   fi
 fi
 
-log "Launching ${BOT_EXE}"
-exec "${BOT_EXE}" >> "${LOG_FILE}" 2>&1 &
+# ─── Run loop with crash-loop guard ──────────────────────────────────────────
+# The bot exits whenever the user invokes /restart (it raises SIGTERM on
+# itself). On Windows there is no systemd Restart=always equivalent — Task
+# Scheduler only restarts on failure, not graceful exit — so this loop is
+# what actually brings the bot back up after /restart.
+#
+# Crash-loop guard: if the bot exits ≥ MAX_FAST_FAILS times within
+# FAST_FAIL_WINDOW seconds, give up and let Task Scheduler's restart-on-
+# failure (configured at task creation) take over (or page a human if it's
+# already exhausted its retries). Prevents runaway log spam when .env or a
+# dependency is broken.
+RELAUNCH_DELAY=2
+MIN_HEALTHY_UPTIME=10        # Restarts that survive ≥ this many seconds
+                             # are considered healthy and reset the counter.
+MAX_FAST_FAILS=5
+FAST_FAIL_WINDOW=60
 
-BOT_PID=$!
-echo "${BOT_PID}" > "${PID_FILE}"
-log "Bot started (PID=${BOT_PID})"
+fast_fail_count=0
+fast_fail_window_start=$(date +%s)
 
-wait "${BOT_PID}"
-RC=$?
-log "Bot exited with code ${RC}"
-rm -f "${PID_FILE}"
-exit "${RC}"
+while true; do
+  log "Launching ${BOT_EXE}"
+  "${BOT_EXE}" >> "${LOG_FILE}" 2>&1 &
+  BOT_PID=$!
+  echo "${BOT_PID}" > "${PID_FILE}"
+  log "Bot started (PID=${BOT_PID})"
+
+  start_time=$(date +%s)
+  wait "${BOT_PID}"
+  RC=$?
+  end_time=$(date +%s)
+  uptime=$(( end_time - start_time ))
+
+  rm -f "${PID_FILE}"
+  log "Bot exited with code ${RC} after ${uptime}s"
+
+  # Reset crash-loop counter on healthy uptime.
+  if (( uptime >= MIN_HEALTHY_UPTIME )); then
+    fast_fail_count=0
+    fast_fail_window_start=${end_time}
+  fi
+
+  # Reset window if it has elapsed.
+  if (( end_time - fast_fail_window_start > FAST_FAIL_WINDOW )); then
+    fast_fail_count=0
+    fast_fail_window_start=${end_time}
+  fi
+
+  # Count this exit as a fast-fail only if uptime was short.
+  if (( uptime < MIN_HEALTHY_UPTIME )); then
+    fast_fail_count=$(( fast_fail_count + 1 ))
+    if (( fast_fail_count >= MAX_FAST_FAILS )); then
+      log "Crash-loop guard tripped (${fast_fail_count} fast fails in ${FAST_FAIL_WINDOW}s window) — exiting wrapper"
+      exit "${RC}"
+    fi
+  fi
+
+  log "Relaunching in ${RELAUNCH_DELAY}s..."
+  sleep "${RELAUNCH_DELAY}"
+done
