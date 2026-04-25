@@ -550,29 +550,143 @@ class MessageOrchestrator:
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Compact one-line status, no buttons."""
+        """Detailed status: model, limits, session, cost."""
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
         dir_display = str(current_dir)
 
         session_id = context.user_data.get("claude_session_id")
-        session_status = "active" if session_id else "none"
+        session_status = "🟢 active" if session_id else "⚪️ none"
+
+        # Model — prefer last seen model from SDK response
+        last_model = context.user_data.get("last_claude_model")
+        model_display = last_model or self.settings.claude_model or "unknown (send a message first)"
+
+        # Timeouts & limits
+        timeout_s = self.settings.claude_timeout_seconds
+        max_turns = self.settings.claude_max_turns
+        session_timeout_h = self.settings.session_timeout_hours
+        max_cost_user = self.settings.claude_max_cost_per_user
+        max_cost_req = self.settings.claude_max_cost_per_request
+
+        # Rate limits
+        rl_requests = self.settings.rate_limit_requests
+        rl_window = self.settings.rate_limit_window
+        rl_burst = self.settings.rate_limit_burst
+
+        # Verbose level
+        verbose_level = self._get_verbose_level(context)
+        verbose_labels = {0: "quiet", 1: "normal", 2: "detailed"}
+        verbose_display = f"{verbose_level} ({verbose_labels.get(verbose_level, '?')})"
 
         # Cost info
-        cost_str = ""
+        current_cost = 0.0
         rate_limiter = context.bot_data.get("rate_limiter")
         if rate_limiter:
             try:
                 user_status = rate_limiter.get_user_status(update.effective_user.id)
                 cost_usage = user_status.get("cost_usage", {})
                 current_cost = cost_usage.get("current", 0.0)
-                cost_str = f" · Cost: ${current_cost:.2f}"
             except Exception:
                 pass
 
+        cost_pct = (current_cost / max_cost_user * 100) if max_cost_user > 0 else 0
+        cost_bar = "█" * int(cost_pct / 10) + "░" * (10 - int(cost_pct / 10))
+
+        # Anthropic API rate limits via raw response headers
+        api_limits_str = ""
+        try:
+            import json as _json
+            import anthropic as _anthropic
+            from datetime import datetime, timezone as _tz
+
+            # Use OAuth token from Claude CLI credentials if no API key set
+            _api_key = (
+                self.settings.anthropic_api_key.get_secret_value()
+                if self.settings.anthropic_api_key
+                else None
+            )
+            if not _api_key:
+                try:
+                    with open("/root/.claude/.credentials.json") as _f:
+                        _creds = _json.load(_f)
+                    _api_key = _creds["claudeAiOauth"]["accessToken"]
+                except Exception:
+                    pass
+
+            if _api_key:
+                _client = _anthropic.Anthropic(api_key=_api_key)
+                _probe_model = last_model or "claude-haiku-4-5"
+                _resp = _client.messages.with_raw_response.create(
+                    model=_probe_model,
+                    max_tokens=1,
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+                # Extract actual model from response
+                _actual_model = _resp.parse().model
+                if _actual_model and not last_model:
+                    context.user_data["last_claude_model"] = _actual_model
+                    model_display = _actual_model
+
+                _h = _resp.headers
+
+                def _fmt_reset(ts: str) -> str:
+                    try:
+                        _dt = datetime.fromtimestamp(int(ts), tz=_tz.utc)
+                        _secs = int((_dt - datetime.now(_tz.utc)).total_seconds())
+                        if _secs <= 0:
+                            return "сейчас"
+                        h, m = divmod(_secs // 60, 60)
+                        return f"через {h}ч {m}м" if h else f"через {m}м"
+                    except Exception:
+                        return ts
+
+                _5h_util = float(_h.get("anthropic-ratelimit-unified-5h-utilization", 0))
+                _7d_util = float(_h.get("anthropic-ratelimit-unified-7d-utilization", 0))
+                _5h_reset = _fmt_reset(_h.get("anthropic-ratelimit-unified-5h-reset", "0"))
+                _7d_reset = _fmt_reset(_h.get("anthropic-ratelimit-unified-7d-reset", "0"))
+                _5h_bar = "█" * int(_5h_util * 10) + "░" * (10 - int(_5h_util * 10))
+                _7d_bar = "█" * int(_7d_util * 10) + "░" * (10 - int(_7d_util * 10))
+
+                api_limits_str = (
+                    f"\n🌐 <b>Anthropic Limits</b>\n"
+                    f"  5h:  [{_5h_bar}] {_5h_util*100:.0f}%  · сброс {_5h_reset}\n"
+                    f"  7d:  [{_7d_bar}] {_7d_util*100:.0f}%  · сброс {_7d_reset}"
+                )
+            else:
+                api_limits_str = "\n🌐 <b>Anthropic Limits</b>\n  <i>недоступно</i>"
+        except Exception as _e:
+            api_limits_str = f"\n🌐 <b>Anthropic Limits</b>\n  <i>ошибка: {_e}</i>"
+
+        lines = [
+            "📊 <b>Bot Status</b>",
+            "",
+            "🤖 <b>Model</b>",
+            f"  Model: <code>{model_display}</code>",
+            f"  Max turns: <code>{max_turns}</code>",
+            f"  Timeout: <code>{timeout_s}s</code>",
+            "",
+            "📂 <b>Session</b>",
+            f"  Directory: <code>{dir_display}</code>",
+            f"  Status: {session_status}",
+            f"  Timeout: <code>{session_timeout_h}h</code>",
+            f"  Verbose: <code>{verbose_display}</code>",
+            "",
+            "💰 <b>Cost (bot)</b>",
+            f"  Used: <code>${current_cost:.4f}</code> / "
+            f"<code>${max_cost_user:.2f}</code>  [{cost_bar}] {cost_pct:.1f}%",
+            f"  Per request limit: <code>${max_cost_req:.2f}</code>",
+            "",
+            "⚡️ <b>Rate Limits (bot)</b>",
+            f"  <code>{rl_requests}</code> req / <code>{rl_window}s</code>"
+            f"  · burst: <code>{rl_burst}</code>",
+            api_limits_str,
+        ]
+
         await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
+            "\n".join(lines),
+            parse_mode="HTML",
         )
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1036,6 +1150,8 @@ class MessageOrchestrator:
                 context.user_data["force_new_session"] = False
 
             context.user_data["claude_session_id"] = claude_response.session_id
+            if claude_response.model:
+                context.user_data["last_claude_model"] = claude_response.model
 
             # Track directory changes
             from .handlers.message import _update_working_directory_from_claude_response

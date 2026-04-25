@@ -124,6 +124,7 @@ class ClaudeResponse:
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
     interrupted: bool = False
+    model: Optional[str] = None
 
 
 @dataclass
@@ -593,11 +594,18 @@ class ClaudeSDKManager:
                 if last_exc is not None:
                     raise last_exc
 
-            # Extract cost, tools, and session_id from result message
+            # Extract cost, tools, session_id and model from result message
             cost = 0.0
             tools_used: List[Dict[str, Any]] = []
             claude_session_id = None
             result_content = None
+            last_model: Optional[str] = None
+            # Extract model from last AssistantMessage
+            for message in messages:
+                if isinstance(message, AssistantMessage):
+                    m = getattr(message, "model", None)
+                    if m:
+                        last_model = m
             for message in messages:
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
@@ -687,6 +695,7 @@ class ClaudeSDKManager:
                 ),
                 tools_used=tools_used,
                 interrupted=interrupted,
+                model=last_model,
             )
 
         except asyncio.TimeoutError:
