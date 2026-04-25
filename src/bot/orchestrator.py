@@ -552,9 +552,10 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Detailed status: model, limits, session, cost."""
-        last_model = context.user_data.get("last_claude_model")
         model_display = (
-            last_model or self.settings.claude_model or "(send a message first)"
+            context.user_data.get("last_claude_model")
+            or self.settings.claude_model
+            or "(send a message first)"
         )
         max_cost_user = self.settings.claude_max_cost_per_user
         max_cost_req = self.settings.claude_max_cost_per_request
