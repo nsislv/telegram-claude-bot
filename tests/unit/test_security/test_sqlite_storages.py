@@ -417,8 +417,7 @@ class TestMigration5Atomicity:
             call_count["n"] += 1
             # Start the rebuild then explode, mimicking a crash
             # between DROP TABLE and RENAME.
-            await conn.execute(
-                """
+            await conn.execute("""
                 CREATE TABLE audit_log_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -428,8 +427,7 @@ class TestMigration5Atomicity:
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     ip_address TEXT
                 )
-                """
-            )
+                """)
             raise RuntimeError("simulated crash mid-migration")
 
         manager._migration_5_drop_audit_log_user_fk = (  # type: ignore[assignment]

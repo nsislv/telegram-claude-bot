@@ -277,13 +277,11 @@ class DatabaseManager:
 
     async def _get_schema_version(self, conn: aiosqlite.Connection) -> int:
         """Get current schema version."""
-        await conn.execute(
-            """
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER PRIMARY KEY
             )
-        """
-        )
+        """)
 
         cursor = await conn.execute("SELECT MAX(version) FROM schema_version")
         row = await cursor.fetchone()
@@ -307,8 +305,7 @@ class DatabaseManager:
         process kill mid-way leaves the pre-migration schema intact
         and the next startup retries cleanly.
         """
-        await conn.execute(
-            """
+        await conn.execute("""
             CREATE TABLE audit_log_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -318,18 +315,15 @@ class DatabaseManager:
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 ip_address TEXT
             )
-            """
-        )
-        await conn.execute(
-            """
+            """)
+        await conn.execute("""
             INSERT INTO audit_log_new
                 (id, user_id, event_type, event_data, success,
                  timestamp, ip_address)
             SELECT id, user_id, event_type, event_data, success,
                    timestamp, ip_address
             FROM audit_log
-            """
-        )
+            """)
         await conn.execute("DROP TABLE audit_log")
         await conn.execute("ALTER TABLE audit_log_new RENAME TO audit_log")
         await conn.execute(
