@@ -242,9 +242,26 @@ class Settings(BaseSettings):
     enable_voice_messages: bool = Field(
         True, description="Enable voice message transcription"
     )
-    voice_provider: Literal["mistral", "openai", "local"] = Field(
+    voice_provider: Literal["mistral", "openai", "local", "faster-whisper"] = Field(
         "mistral",
-        description="Voice transcription provider: 'mistral', 'openai', or 'local'",
+        description=(
+            "Voice transcription provider: 'mistral', 'openai', 'local', "
+            "or 'faster-whisper'"
+        ),
+    )
+    faster_whisper_model: str = Field(
+        "base",
+        description=(
+            "faster-whisper model size when VOICE_PROVIDER=faster-whisper. "
+            "Options: tiny, base, small, medium, large-v2, large-v3"
+        ),
+    )
+    faster_whisper_language: Optional[str] = Field(
+        None,
+        description=(
+            "Language hint for faster-whisper (e.g. 'ru', 'lv', 'en'). "
+            "Auto-detected if unset."
+        ),
     )
     mistral_api_key: Optional[SecretStr] = Field(
         None, description="Mistral API key for voice transcription"
@@ -509,9 +526,10 @@ class Settings(BaseSettings):
         if v is None:
             return "mistral"
         provider = str(v).strip().lower()
-        if provider not in {"mistral", "openai", "local"}:
+        if provider not in {"mistral", "openai", "local", "faster-whisper"}:
             raise ValueError(
-                "voice_provider must be one of ['mistral', 'openai', 'local']"
+                "voice_provider must be one of "
+                "['mistral', 'openai', 'local', 'faster-whisper']"
             )
         return provider
 
@@ -621,6 +639,8 @@ class Settings(BaseSettings):
             return "whisper-1"
         if self.voice_provider == "local":
             return self.whisper_cpp_model_path or "base"
+        if self.voice_provider == "faster-whisper":
+            return self.faster_whisper_model
         return "voxtral-mini-latest"
 
     @property
@@ -633,7 +653,7 @@ class Settings(BaseSettings):
         """API key environment variable required for the configured voice provider."""
         if self.voice_provider == "openai":
             return "OPENAI_API_KEY"
-        if self.voice_provider == "local":
+        if self.voice_provider in {"local", "faster-whisper"}:
             return ""
         return "MISTRAL_API_KEY"
 
@@ -644,6 +664,8 @@ class Settings(BaseSettings):
             return "OpenAI Whisper"
         if self.voice_provider == "local":
             return "Local whisper.cpp"
+        if self.voice_provider == "faster-whisper":
+            return f"Local faster-whisper ({self.faster_whisper_model})"
         return "Mistral Voxtral"
 
     @property
