@@ -1,6 +1,7 @@
 """Message handlers for non-command inputs."""
 
 import asyncio
+import contextlib
 from typing import Optional
 
 import structlog
@@ -471,29 +472,24 @@ async def handle_text_message(
                                 )
                             caption_sent = True
                         else:
-                            media = []
-                            file_handles = []
-                            for idx, img in enumerate(photos[:10]):
-                                fh = open(img.path, "rb")  # noqa: SIM115
-                                file_handles.append(fh)
-                                media.append(
-                                    InputMediaPhoto(
-                                        media=fh,
-                                        caption=msg.text if idx == 0 else None,
-                                        parse_mode=(
-                                            msg.parse_mode if idx == 0 else None
-                                        ),
+                            with contextlib.ExitStack() as stack:
+                                media = []
+                                for idx, img in enumerate(photos[:10]):
+                                    fh = stack.enter_context(open(img.path, "rb"))
+                                    media.append(
+                                        InputMediaPhoto(
+                                            media=fh,
+                                            caption=msg.text if idx == 0 else None,
+                                            parse_mode=(
+                                                msg.parse_mode if idx == 0 else None
+                                            ),
+                                        )
                                     )
-                                )
-                            try:
                                 await update.message.chat.send_media_group(
                                     media=media,
                                     reply_to_message_id=update.message.message_id,
                                 )
                                 caption_sent = True
-                            finally:
-                                for fh in file_handles:
-                                    fh.close()
                     except Exception as album_err:
                         logger.warning(
                             "Failed to send photo+caption", error=str(album_err)
@@ -554,20 +550,15 @@ async def handle_text_message(
                                     reply_to_message_id=update.message.message_id,
                                 )
                         else:
-                            media = []
-                            file_handles = []
-                            for img in photos[:10]:
-                                fh = open(img.path, "rb")  # noqa: SIM115
-                                file_handles.append(fh)
-                                media.append(InputMediaPhoto(media=fh))
-                            try:
+                            with contextlib.ExitStack() as stack:
+                                media = []
+                                for img in photos[:10]:
+                                    fh = stack.enter_context(open(img.path, "rb"))
+                                    media.append(InputMediaPhoto(media=fh))
                                 await update.message.chat.send_media_group(
                                     media=media,
                                     reply_to_message_id=update.message.message_id,
                                 )
-                            finally:
-                                for fh in file_handles:
-                                    fh.close()
                     except Exception as album_err:
                         logger.warning(
                             "Failed to send photo album", error=str(album_err)

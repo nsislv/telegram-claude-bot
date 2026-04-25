@@ -303,7 +303,7 @@ class JsonlAuditStorage(AuditStorage):
         try:
             import os
 
-            os.chmod(self.path, 0o640)
+            os.chmod(self.path, 0o600)
         except (OSError, NotImplementedError):
             logger.debug(
                 "Could not chmod audit log (non-POSIX fs?)", path=str(self.path)

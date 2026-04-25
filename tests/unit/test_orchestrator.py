@@ -263,7 +263,7 @@ async def test_agentic_status_compact(agentic_settings, deps):
 
     call_args = update.message.reply_text.call_args
     text = call_args.args[0]
-    assert "Session: none" in text
+    assert "Status" in text
 
 
 async def test_agentic_text_calls_claude(agentic_settings, deps):

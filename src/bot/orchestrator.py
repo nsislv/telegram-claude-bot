@@ -6,6 +6,7 @@ classic mode, delegates to existing full-featured handlers.
 """
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -551,34 +552,9 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Detailed status: model, limits, session, cost."""
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
-        dir_display = str(current_dir)
-
-        session_id = context.user_data.get("claude_session_id")
-        session_status = "🟢 active" if session_id else "⚪️ none"
-
-        # Model — prefer last seen model from SDK response
         last_model = context.user_data.get("last_claude_model")
-        model_display = last_model or self.settings.claude_model or "unknown (send a message first)"
-
-        # Timeouts & limits
-        timeout_s = self.settings.claude_timeout_seconds
-        max_turns = self.settings.claude_max_turns
-        session_timeout_h = self.settings.session_timeout_hours
         max_cost_user = self.settings.claude_max_cost_per_user
         max_cost_req = self.settings.claude_max_cost_per_request
-
-        # Rate limits
-        rl_requests = self.settings.rate_limit_requests
-        rl_window = self.settings.rate_limit_window
-        rl_burst = self.settings.rate_limit_burst
-
-        # Verbose level
-        verbose_level = self._get_verbose_level(context)
-        verbose_labels = {0: "quiet", 1: "normal", 2: "detailed"}
-        verbose_display = f"{verbose_level} ({verbose_labels.get(verbose_level, '?')})"
 
         # Cost info
         current_cost = 0.0
@@ -589,7 +565,8 @@ class MessageOrchestrator:
                 cost_usage = user_status.get("cost_usage", {})
                 current_cost = cost_usage.get("current", 0.0)
             except Exception:
-                pass
+                # Rate limiter shape varies; fall back to 0 cost.
+                logger.debug("rate_limiter.get_user_status failed", exc_info=True)
 
         cost_pct = (current_cost / max_cost_user * 100) if max_cost_user > 0 else 0
         cost_bar = "█" * int(cost_pct / 10) + "░" * (10 - int(cost_pct / 10))
@@ -598,8 +575,10 @@ class MessageOrchestrator:
         api_limits_str = ""
         try:
             import json as _json
+            from datetime import datetime
+            from datetime import timezone as _tz
+
             import anthropic as _anthropic
-            from datetime import datetime, timezone as _tz
 
             # Use OAuth token from Claude CLI credentials if no API key set
             _api_key = (
@@ -613,7 +592,8 @@ class MessageOrchestrator:
                         _creds = _json.load(_f)
                     _api_key = _creds["claudeAiOauth"]["accessToken"]
                 except Exception:
-                    pass
+                    # Credentials file optional; fall through to "unavailable".
+                    logger.debug("Claude OAuth credentials not readable", exc_info=True)
 
             if _api_key:
                 _client = _anthropic.Anthropic(api_key=_api_key)
@@ -627,7 +607,6 @@ class MessageOrchestrator:
                 _actual_model = _resp.parse().model
                 if _actual_model and not last_model:
                     context.user_data["last_claude_model"] = _actual_model
-                    model_display = _actual_model
 
                 _h = _resp.headers
 
@@ -642,10 +621,18 @@ class MessageOrchestrator:
                     except Exception:
                         return ts
 
-                _5h_util = float(_h.get("anthropic-ratelimit-unified-5h-utilization", 0))
-                _7d_util = float(_h.get("anthropic-ratelimit-unified-7d-utilization", 0))
-                _5h_reset = _fmt_reset(_h.get("anthropic-ratelimit-unified-5h-reset", "0"))
-                _7d_reset = _fmt_reset(_h.get("anthropic-ratelimit-unified-7d-reset", "0"))
+                _5h_util = float(
+                    _h.get("anthropic-ratelimit-unified-5h-utilization", 0)
+                )
+                _7d_util = float(
+                    _h.get("anthropic-ratelimit-unified-7d-utilization", 0)
+                )
+                _5h_reset = _fmt_reset(
+                    _h.get("anthropic-ratelimit-unified-5h-reset", "0")
+                )
+                _7d_reset = _fmt_reset(
+                    _h.get("anthropic-ratelimit-unified-7d-reset", "0")
+                )
                 _5h_bar = "█" * int(_5h_util * 10) + "░" * (10 - int(_5h_util * 10))
                 _7d_bar = "█" * int(_7d_util * 10) + "░" * (10 - int(_7d_util * 10))
 
@@ -968,31 +955,28 @@ class MessageOrchestrator:
                         )
                     caption_sent = use_caption
                 else:
-                    media = []
-                    file_handles = []
-                    for idx, img in enumerate(photos[:10]):
-                        fh = open(img.path, "rb")  # noqa: SIM115
-                        file_handles.append(fh)
-                        media.append(
-                            InputMediaPhoto(
-                                media=fh,
-                                caption=caption if use_caption and idx == 0 else None,
-                                parse_mode=(
-                                    caption_parse_mode
-                                    if use_caption and idx == 0
-                                    else None
-                                ),
+                    with contextlib.ExitStack() as stack:
+                        media = []
+                        for idx, img in enumerate(photos[:10]):
+                            fh = stack.enter_context(open(img.path, "rb"))
+                            media.append(
+                                InputMediaPhoto(
+                                    media=fh,
+                                    caption=(
+                                        caption if use_caption and idx == 0 else None
+                                    ),
+                                    parse_mode=(
+                                        caption_parse_mode
+                                        if use_caption and idx == 0
+                                        else None
+                                    ),
+                                )
                             )
-                        )
-                    try:
                         await update.message.chat.send_media_group(
                             media=media,
                             reply_to_message_id=reply_to_message_id,
                         )
                         caption_sent = use_caption
-                    finally:
-                        for fh in file_handles:
-                            fh.close()
             except Exception as e:
                 logger.warning("Failed to send photo album", error=str(e))
 
