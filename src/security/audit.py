@@ -10,7 +10,6 @@ Features:
 
 import asyncio
 import json
-import weakref
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -286,60 +285,50 @@ class JsonlAuditStorage(AuditStorage):
         self.path = path
         self._fsync_each_write = fsync_each_write
         self._lock = asyncio.Lock()
-        self._fh: Optional[Any] = None
-
-    async def _ensure_open(self) -> Any:
-        if self._fh is not None and not self._fh.closed:
-            return self._fh
-        # Make the parent directory on first write rather than at
-        # construction — tests instantiate with a temp path that may
-        # not exist yet.
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # ``a+`` so we can both append and later read. Line-buffered so
-        # each write reaches the OS even before fsync.
-        self._fh = open(self.path, "a+", buffering=1, encoding="utf-8")
-        # Belt-and-braces cleanup: ``close()`` is the primary path, but
-        # if a caller forgets, the finalizer guarantees the FD still
-        # gets released when the storage is collected. Also makes the
-        # close lifecycle explicit to static analyzers.
-        weakref.finalize(self, self._fh.close)
-        # Best-effort tighten perms. ``chmod`` is a no-op on Windows
-        # filesystems that don't support Unix perms; we log and
-        # continue rather than fail.
-        try:
-            import os
-
-            os.chmod(self.path, 0o600)
-        except (OSError, NotImplementedError):
-            logger.debug(
-                "Could not chmod audit log (non-POSIX fs?)", path=str(self.path)
-            )
-        return self._fh
 
     async def store_event(self, event: AuditEvent) -> None:
         """Append one JSON line per event, then fsync.
 
-        The underlying ``self._fh`` is intentionally kept open across
-        writes for performance — opened lazily by ``_ensure_open`` and
-        released by ``close``. We don't bind a local alias here so
-        static analyzers don't mistake this for a leaked handle.
+        The file is opened and closed per write. Audit volume is low
+        and ``fsync`` already dominates the per-write cost, so the FD
+        churn is negligible — and avoiding a long-lived handle keeps
+        the close lifecycle trivially correct.
         """
         async with self._lock:
-            await self._ensure_open()
-            # ``event.to_json`` handles datetime serialisation.
-            self._fh.write(event.to_json())
-            self._fh.write("\n")
-            self._fh.flush()
-            if self._fsync_each_write:
-                try:
-                    import os
+            # Make the parent directory on first write rather than at
+            # construction — tests instantiate with a temp path that
+            # may not exist yet.
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # ``a+`` so we can both append and later read. Line-buffered
+            # so each write reaches the OS even before fsync.
+            with open(self.path, "a+", buffering=1, encoding="utf-8") as fh:
+                # ``event.to_json`` handles datetime serialisation.
+                fh.write(event.to_json())
+                fh.write("\n")
+                fh.flush()
+                if self._fsync_each_write:
+                    try:
+                        import os
 
-                    os.fsync(self._fh.fileno())
-                except OSError:
-                    # fsync can fail on some filesystems / pipes —
-                    # the line is already in the OS buffer, and log
-                    # forwarders will pick it up.
-                    logger.debug("fsync failed on audit log", path=str(self.path))
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        # fsync can fail on some filesystems / pipes —
+                        # the line is already in the OS buffer, and
+                        # log forwarders will pick it up.
+                        logger.debug("fsync failed on audit log", path=str(self.path))
+
+            # Best-effort tighten perms. ``chmod`` is a no-op on
+            # Windows filesystems that don't support Unix perms; we
+            # log and continue rather than fail.
+            try:
+                import os
+
+                os.chmod(self.path, 0o600)
+            except (OSError, NotImplementedError):
+                logger.debug(
+                    "Could not chmod audit log (non-POSIX fs?)",
+                    path=str(self.path),
+                )
 
         if event.risk_level in ("high", "critical"):
             logger.warning(
@@ -421,19 +410,10 @@ class JsonlAuditStorage(AuditStorage):
         )
 
     async def close(self) -> None:
-        async with self._lock:
-            if self._fh is not None and not self._fh.closed:
-                try:
-                    self._fh.flush()
-                    import os
-
-                    os.fsync(self._fh.fileno())
-                except OSError:
-                    # fsync may fail on closed pipes / non-POSIX fs;
-                    # close still proceeds below to release the FD.
-                    pass
-                self._fh.close()
-            self._fh = None
+        # No-op: ``store_event`` opens and closes the file per write,
+        # so there is no persistent handle to release. Method retained
+        # for API parity with other ``AuditStorage`` backends.
+        return None
 
 
 class CompositeAuditStorage(AuditStorage):
