@@ -553,6 +553,9 @@ class MessageOrchestrator:
     ) -> None:
         """Detailed status: model, limits, session, cost."""
         last_model = context.user_data.get("last_claude_model")
+        model_display = (
+            last_model or self.settings.claude_model or "(send a message first)"
+        )
         max_cost_user = self.settings.claude_max_cost_per_user
         max_cost_req = self.settings.claude_max_cost_per_request
 
@@ -572,7 +575,8 @@ class MessageOrchestrator:
         cost_bar = "█" * int(cost_pct / 10) + "░" * (10 - int(cost_pct / 10))
 
         # Anthropic rate limits — read from cache saved after last Claude response
-        from datetime import datetime, timezone as _tz
+        from datetime import datetime
+        from datetime import timezone as _tz
 
         def _fmt_reset(ts: str) -> str:
             try:
